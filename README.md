@@ -28,6 +28,8 @@ A reinforcement learning project for **Unitree Go2 locomotion**, covering the co
 Unitree-Go2-Adaptive-Energy-Flat
 ```
 
+该平地训练任务的详细设计——包括奖励函数公式与速度课程机制——见 [平地训练任务介绍](<doc/平地训练任务介绍.md>)。
+
 项目不仅关注策略能否训练成功，也重点关注训练与部署之间 Observation、Action、Joint Order、PD Gains 和 Control Frequency 等接口是否严格一致，使训练得到的策略可以在独立物理仿真器中重新构建完整控制闭环。
 
 ---
@@ -224,6 +226,10 @@ Passive
 
 ## Documentation
 
+训练任务本身的设计说明请先阅读：
+
+[平地训练任务介绍](<doc/平地训练任务介绍.md>)——详细说明 Adaptive Energy 奖励函数（含公式）与速度课程设置。
+
 完整 Sim-to-Sim 教程按照从原理到部署的顺序划分为七个阶段：
 
 | Stage | 内容 |
@@ -266,6 +272,7 @@ Unitree-Go2-Emergent-Gait-Locomotion/
 │
 ├── doc/
 │   ├── Installation.md
+│   ├── 平地训练任务介绍.md
 │   ├── Sim2Sim/
 │   └── licenses/
 │
