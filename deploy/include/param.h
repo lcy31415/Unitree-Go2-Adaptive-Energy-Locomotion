@@ -118,8 +118,11 @@ inline std::filesystem::path parser_policy_dir(std::filesystem::path policy_dir)
 /* ---------- Command Line Parameters ---------- */
 namespace po = boost::program_options;
 
+// global copy of the parsed command line (set by helper(), read by FSM states)
+inline po::variables_map vm;
+
 //※ This function must be called at the beginning of main() function
-inline po::variables_map helper(int argc, char** argv) 
+inline po::variables_map helper(int argc, char** argv)
 {
     bin_path = get_bin_path();
     load_config_file();
@@ -130,6 +133,9 @@ inline po::variables_map helper(int argc, char** argv)
         ("version,v", "show version")
         ("log", "record log file")
         ("network,n", po::value<std::string>()->default_value(""), "dds network interface")
+        ("domain", po::value<int>()->default_value(1), "dds domain id (sim2sim: 1, real robot: 0)")
+        ("pc-command", "enable PC keyboard velocity commands for the RL policy "
+                       "(1: fwd, 2: back, 3: left, 4: right, 0: stop)")
         ;
 
     po::variables_map vm;
@@ -157,6 +163,8 @@ inline po::variables_map helper(int argc, char** argv)
         std::filesystem::create_directories(proj_dir / "log");
         spdlog::create_logger(proj_dir.string() + "/log/log.txt");
     }
+
+    param::vm = vm;
 
     return vm;
 }

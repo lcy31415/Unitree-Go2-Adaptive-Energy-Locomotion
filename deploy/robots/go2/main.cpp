@@ -33,8 +33,16 @@ int main(int argc, char** argv)
     std::cout << " --- Unitree Robotics --- \n";
     std::cout << "     Go2 Controller \n";
 
-    // Unitree DDS Config
-    unitree::robot::ChannelFactory::Instance()->Init(1, vm["network"].as<std::string>());
+    // Unitree DDS Config: sim and real are separated explicitly.
+    //   MuJoCo sim2sim : --domain 1 --network lo
+    //   Real Go2       : --domain 0 --network enp6s0
+    const int domain = vm["domain"].as<int>();
+    if (domain == 0)
+        std::cout << "\n *** REAL ROBOT MODE (domain 0) — motor commands ENABLED ***\n\n";
+    else
+        std::cout << " sim2sim mode (domain " << domain << ")\n\n";
+
+    unitree::robot::ChannelFactory::Instance()->Init(domain, vm["network"].as<std::string>());
 
     init_fsm_state();
 
