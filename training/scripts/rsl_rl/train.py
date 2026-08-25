@@ -12,6 +12,10 @@ import gymnasium as gym
 import pathlib
 import sys
 
+_SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[2] / "source" / "unitree_rl_lab"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
 sys.path.insert(0, f"{pathlib.Path(__file__).parent.parent}")
 from list_envs import import_packages  # noqa: F401
 

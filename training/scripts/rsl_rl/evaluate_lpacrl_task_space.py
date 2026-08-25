@@ -6,11 +6,16 @@ import argparse
 import csv
 import json
 import os
+import sys
 from collections import defaultdict
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
 from types import MethodType
+
+_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "source" / "unitree_rl_lab"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
 
 from isaaclab.app import AppLauncher
 

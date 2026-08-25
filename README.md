@@ -276,6 +276,8 @@ tools/real_robot/
 
 ## Documentation
 
+常用训练 / 演示 / 评测命令见 [指令使用指南](training/doc/指令使用指南.md)。
+
 训练任务本身的设计说明请先阅读：
 
 [平地训练任务介绍](<deployment/doc/平地训练任务介绍.md>)——详细说明 Adaptive Energy 奖励函数（含公式）与速度课程设置。
