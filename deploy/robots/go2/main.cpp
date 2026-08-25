@@ -19,6 +19,7 @@ void init_fsm_state()
     }
     FSMState::lowcmd = std::make_unique<LowCmd_t>();
     FSMState::lowstate = std::make_shared<LowState_t>();
+    FSMState::keyboard = std::make_shared<Keyboard>();
     spdlog::info("Waiting for connection to robot...");
     FSMState::lowstate->wait_for_connection();
     spdlog::info("Connected to robot.");
@@ -33,7 +34,7 @@ int main(int argc, char** argv)
     std::cout << "     Go2 Controller \n";
 
     // Unitree DDS Config
-    unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
+    unitree::robot::ChannelFactory::Instance()->Init(1, vm["network"].as<std::string>());
 
     init_fsm_state();
 

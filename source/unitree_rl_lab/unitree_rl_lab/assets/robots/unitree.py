@@ -13,12 +13,14 @@ import os
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 
 from unitree_rl_lab.assets.robots import unitree_actuators
 
-UNITREE_MODEL_DIR = "path/to/unitree_model"  # Replace with the actual path to your unitree_model directory
-UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
+# Override with the UNITREE_MODEL_DIR / UNITREE_ROS_DIR environment variables
+# when running on another machine (the fallback is this workstation's path).
+UNITREE_MODEL_DIR = os.environ.get("UNITREE_MODEL_DIR", "/home/lcy/workspace/robotics/unitree_model")
+UNITREE_ROS_DIR = os.environ.get("UNITREE_ROS_DIR", "/home/lcy/workspace/robotics/unitree_ros")
 
 
 @configclass

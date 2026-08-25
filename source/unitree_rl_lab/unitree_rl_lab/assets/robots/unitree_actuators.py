@@ -4,7 +4,7 @@ import torch
 from dataclasses import MISSING
 
 from isaaclab.actuators import DelayedPDActuator, DelayedPDActuatorCfg
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 from isaaclab.utils.types import ArticulationActions
 
 

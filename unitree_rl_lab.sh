@@ -76,7 +76,11 @@ case "$1" in
         ;;
     -t|--train)
         shift
-        ${python_exe} ${UNITREE_RL_LAB_PATH}/scripts/rsl_rl/train.py --headless "$@"
+        # AppLauncher now derives headless mode from the visualizer selection:
+        # no --viz stays headless, while --viz kit creates a real interactive
+        # viewport. Forcing the deprecated --headless flag here disables the
+        # Kit viewport even when the user explicitly requests it.
+        ${python_exe} ${UNITREE_RL_LAB_PATH}/scripts/rsl_rl/train.py "$@"
         ;;
     *) # unknown option
         ;;

@@ -27,5 +27,5 @@ FSM:
   Velocity:
     transitions: 
       Passive: LT + B.on_pressed
-    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+    policy_dir: /home/lcy/workspace/papers/unitree_rl_lab/logs/rsl_rl/unitree_go2_adaptive_energy_flat/example
     

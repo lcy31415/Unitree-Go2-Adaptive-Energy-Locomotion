@@ -73,3 +73,8 @@ datasets
 
 # Mimic
 *.npz
+
+# Local backup files
+*.bak
+*.bak_*
+*.bak*

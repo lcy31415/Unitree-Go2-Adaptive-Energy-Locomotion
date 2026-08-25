@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 
 
@@ -34,3 +34,24 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class AdaptiveEnergyPPORunnerCfg(BasePPORunnerCfg):
+    """PPO runner settings for the adaptive-energy experiment."""
+
+    save_interval = 500
+
+
+@configclass
+class AdaptiveEnergyFlatLPACRLPPORunnerCfg(AdaptiveEnergyPPORunnerCfg):
+    """Independent log namespace for the flat LP-ACRL experiment."""
+
+    experiment_name = "unitree_go2_adaptive_energy_flat_lpacrl"
+
+
+@configclass
+class AdaptiveEnergyTerrainLPACRLPPORunnerCfg(AdaptiveEnergyPPORunnerCfg):
+    """Independent log namespace for rough-terrain LP-ACRL training."""
+
+    experiment_name = "unitree_go2_adaptive_energy_terrain_lpacrl"

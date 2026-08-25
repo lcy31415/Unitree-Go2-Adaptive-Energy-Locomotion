@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import MISSING
 
 from isaaclab.envs.mdp import UniformVelocityCommandCfg
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 
 
 @configclass

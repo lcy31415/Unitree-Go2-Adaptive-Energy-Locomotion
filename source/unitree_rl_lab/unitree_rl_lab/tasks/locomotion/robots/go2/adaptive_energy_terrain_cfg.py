@@ -1,0 +1,67 @@
+"""Composite rough-terrain generator for adaptive-energy Go2 locomotion."""
+
+import isaaclab.terrains as terrain_gen
+
+
+# The proportions intentionally sum to one.  The reference project uses the
+# same terrain families, but its published values sum to 1.2 and are therefore
+# implicitly renormalized by Isaac Lab.
+ADAPTIVE_ENERGY_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    curriculum=True,
+    sub_terrains={
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.20),
+        "pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.15,
+            slope_range=(0.0, 0.20),
+            platform_width=3.0,
+            border_width=0.25,
+        ),
+        "pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.10,
+            slope_range=(0.0, 0.20),
+            platform_width=3.0,
+            border_width=0.25,
+        ),
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.15,
+            noise_range=(0.01, 0.10),
+            noise_step=0.01,
+            downsampled_scale=0.20,
+            border_width=0.25,
+        ),
+        "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+            proportion=0.15,
+            step_height_range=(0.05, 0.15),
+            step_width=0.30,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.15,
+            step_height_range=(0.05, 0.15),
+            step_width=0.30,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        "discrete_obstacles": terrain_gen.HfDiscreteObstaclesTerrainCfg(
+            proportion=0.10,
+            obstacle_height_mode="choice",
+            obstacle_width_range=(1.0, 2.0),
+            obstacle_height_range=(0.05, 0.10),
+            num_obstacles=20,
+            platform_width=3.0,
+            border_width=0.25,
+        ),
+    },
+)
