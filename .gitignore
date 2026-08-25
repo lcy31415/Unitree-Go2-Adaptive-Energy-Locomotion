@@ -1,0 +1,37 @@
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/.pytest_cache/
+
+# Training outputs
+**/logs/
+**/runs/
+**/outputs/
+**/videos/
+**/wandb/
+**/recordings/
+
+# Models and exported policies
+**/*.pt
+**/*.pth
+**/*.onnx
+
+# Build outputs
+**/build/
+**/cmake-build*/
+**/*.so
+
+# Local environments and caches
+**/.venv/
+**/env.yaml
+_isaac_sim*
+
+# Editors
+**/.idea/
+**/.vscode/
+
+# Local backup files
+*.bak
+*.bak_*
+*.bak*
