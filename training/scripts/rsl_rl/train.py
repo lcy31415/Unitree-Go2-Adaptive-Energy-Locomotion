@@ -395,7 +395,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-    export_deploy_cfg(env.unwrapped, log_dir)
+    actor_observation_groups = None
+    if isinstance(agent_cfg.obs_groups, dict):
+        actor_observation_groups = agent_cfg.obs_groups.get("actor")
+    export_deploy_cfg(
+        env.unwrapped,
+        log_dir,
+        observation_group_names=actor_observation_groups,
+    )
     # copy the environment configuration file to the log directory
     shutil.copy(
         inspect.getfile(env_cfg.__class__),

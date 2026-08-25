@@ -59,3 +59,20 @@ gym.register(
         ),
     },
 )
+
+gym.register(
+    id="Unitree-Go2-Adaptive-Energy-LPACRL-PIE",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_lpacrl_pie_env_cfg:AdaptiveEnergyLPACRLPIEEnvCfg"
+        ),
+        "play_env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_lpacrl_pie_env_cfg:AdaptiveEnergyLPACRLPIEPlayEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            "unitree_rl_lab.tasks.locomotion.agents.pie_cfg:AdaptiveEnergyLPACRLPIERunnerCfg"
+        ),
+    },
+)
