@@ -1,0 +1,40 @@
+FSM:
+  _: # enabled fsms
+    Passive:
+      id: 1
+    FixStand:
+      id: 2
+    Velocity:
+      id: 3
+      type: RLBase
+  Passive:
+    transitions: 
+      FixStand: LT + A.on_pressed
+    mode: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    kd: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+  FixStand:
+    transitions: 
+      Passive: LT + B.on_pressed
+      Velocity: start.on_pressed
+    kp: [60, 80, 80, 60, 80, 80, 60, 80, 80, 60, 80, 80]
+    kd: [5, 4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4]
+    ts: [0, 1, 2]
+    qs: [
+      [],
+      [0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65],
+      [0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5],
+    ]
+  Velocity:
+    transitions: 
+      Passive: LT + B.on_pressed
+    policy_dir: ../../../pretrained/example
+    # RL entry protocol (State_RLBase)
+    warmup_time: 1.0            # s: hold entry pose while 30-frame history fills (>= 0.6 s)
+    blend_time: 1.5             # s: q_cmd = (1-a) q_start + a q_rl, a: 0 -> 1
+    # Runtime safety gate (violation -> Passive)
+    safety_max_action_abs: 6.0  # max |raw policy action|
+    safety_max_q_des_dev: 0.8   # rad, max |q_des - q_real| per joint
+    # PC keyboard velocity commands (--pc-command): keys 1/2/3/4/0
+    pc_cmd_speed: 0.1           # m/s (keys 1/2)
+    pc_cmd_yaw_rate: 0.3        # rad/s (keys 3/4)
+    pc_cmd_duration: 5.0        # s, auto-zero timeout
