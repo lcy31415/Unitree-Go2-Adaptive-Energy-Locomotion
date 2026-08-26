@@ -475,9 +475,9 @@ def main() -> None:
             actions = policy(observation)
             actions[fixed_course & (failed | succeeded)] = 0.0
             observation, _, dones, _ = env.step(actions)
+            if getattr(policy, "is_recurrent", False):
+                policy.reset(dones.bool())
         done_mask = dones.bool()
-        if getattr(policy, "is_recurrent", False):
-            policy.reset(done_mask)
         alive &= ~done_mask
 
         root_pos = _as_torch(robot.data.root_pos_w)
