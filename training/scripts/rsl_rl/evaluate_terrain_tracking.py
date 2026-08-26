@@ -24,8 +24,16 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 
+_DEFAULT_TASK = "Unitree-Go2-Adaptive-Energy-Terrain-LPACRL"
+_PIE_TASK = "Unitree-Go2-Adaptive-Energy-LPACRL-PIE"
+
+
 parser = argparse.ArgumentParser(description="Evaluate terrain-conditioned speed tracking.")
-parser.add_argument("--task", default="Unitree-Go2-Adaptive-Energy-Terrain-LPACRL")
+parser.add_argument(
+    "--task",
+    default=None,
+    help="Gym task ID. If omitted, infer the PIE task from the checkpoint path and otherwise use Terrain-LPACRL.",
+)
 parser.add_argument("--checkpoint", default=None)
 parser.add_argument("--speeds", type=float, nargs="+", default=[0.5, 1.0, 1.5, 2.0, 2.5])
 parser.add_argument("--terrain_levels", type=int, nargs="+", default=[0, 1, 2, 3])
@@ -70,6 +78,7 @@ parser.add_argument("--disable_fabric", action="store_true")
 parser.add_argument("--no_plots", action="store_true", default=False, help="Only export CSV/JSON files.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+_TASK_WAS_EXPLICIT = args_cli.task is not None
 
 if args_cli.checkpoint is None:
     parser.error("--checkpoint is required.")
@@ -81,6 +90,10 @@ if args_cli.rough_runup_distance < 0.0:
     parser.error("rough_runup_distance must be non-negative.")
 if args_cli.heading_control_gain < 0.0 or args_cli.max_heading_command <= 0.0:
     parser.error("Heading-control gain must be non-negative and its command limit must be positive.")
+if args_cli.task is None:
+    checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
+    args_cli.task = _PIE_TASK if "lpacrl_pie" in checkpoint_hint else _DEFAULT_TASK
+    print(f"[INFO] Inferred task {args_cli.task!r} from checkpoint path.")
 if args_cli.multi_robot_view:
     selected_visualizers = list(args_cli.visualizer or [])
     if "kit" not in selected_visualizers:
@@ -120,6 +133,45 @@ _FIXED_COURSE_GEOMETRY = {
 
 def _as_torch(value):
     return getattr(value, "torch", value)
+
+
+def _checkpoint_is_pie(checkpoint: str) -> bool:
+    """Identify PIE actor checkpoints from their state-dict contract."""
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    actor_state = saved.get("actor_state_dict")
+    if not isinstance(actor_state, dict):
+        raise KeyError(f"Checkpoint {checkpoint!r} has no actor_state_dict.")
+    return "vae_mu_head.weight" in actor_state and "depth_encoder.0.weight" in actor_state
+
+
+def _resolve_task_for_checkpoint(task: str, checkpoint: str, *, explicit: bool) -> str:
+    """Validate an explicit task or correct an inferred task using checkpoint contents."""
+    checkpoint_is_pie = _checkpoint_is_pie(checkpoint)
+    task_is_pie = task == _PIE_TASK
+    if checkpoint_is_pie != task_is_pie:
+        expected = _PIE_TASK if checkpoint_is_pie else _DEFAULT_TASK
+        checkpoint_kind = "PIE" if checkpoint_is_pie else "non-PIE"
+        if explicit:
+            raise ValueError(
+                f"The {checkpoint_kind} checkpoint is incompatible with task {task!r}. "
+                f"Use --task {expected}."
+            )
+        print(f"[INFO] Checkpoint contents select task {expected!r} instead of inferred task {task!r}.")
+        return expected
+    return task
+
+
+def _disable_observation_corruption(env_cfg) -> None:
+    """Disable evaluation noise for both flat-policy and PIE observation layouts."""
+    observations = env_cfg.observations
+    configured = False
+    for group_name in ("policy", "actor", "proprio_history"):
+        group = getattr(observations, group_name, None)
+        if group is not None and hasattr(group, "enable_corruption"):
+            group.enable_corruption = False
+            configured = True
+    if not configured:
+        raise AttributeError("Task has no policy, actor or proprio_history observation group to configure.")
 
 
 def _terrain_columns() -> dict[str, list[int]]:
@@ -270,6 +322,11 @@ def main() -> None:
     checkpoint = str(Path(args_cli.checkpoint).expanduser().resolve())
     if not os.path.isfile(checkpoint):
         raise FileNotFoundError(checkpoint)
+    args_cli.task = _resolve_task_for_checkpoint(
+        args_cli.task,
+        checkpoint,
+        explicit=_TASK_WAS_EXPLICIT,
+    )
 
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -291,7 +348,7 @@ def main() -> None:
             lin_vel_x=(-2.5, 2.5), lin_vel_y=(0.0, 0.0), ang_vel_z=(-2.5, 2.5)
         ),
     )
-    env_cfg.observations.policy.enable_corruption = False
+    _disable_observation_corruption(env_cfg)
     env_cfg.events.physics_material = None
     env_cfg.events.add_base_mass = None
     env_cfg.events.push_robot = None
@@ -419,6 +476,8 @@ def main() -> None:
             actions[fixed_course & (failed | succeeded)] = 0.0
             observation, _, dones, _ = env.step(actions)
         done_mask = dones.bool()
+        if getattr(policy, "is_recurrent", False):
+            policy.reset(done_mask)
         alive &= ~done_mask
 
         root_pos = _as_torch(robot.data.root_pos_w)
