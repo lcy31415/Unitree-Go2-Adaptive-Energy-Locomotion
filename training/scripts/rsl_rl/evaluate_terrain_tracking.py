@@ -76,6 +76,11 @@ parser.add_argument(
 )
 parser.add_argument("--disable_fabric", action="store_true")
 parser.add_argument("--no_plots", action="store_true", default=False, help="Only export CSV/JSON files.")
+parser.add_argument(
+    "--zero_depth_observation",
+    action="store_true",
+    help="PIE ablation: replace the complete camera depth-history observation with zeros before every action.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 _TASK_WAS_EXPLICIT = args_cli.task is not None
@@ -172,6 +177,15 @@ def _disable_observation_corruption(env_cfg) -> None:
             configured = True
     if not configured:
         raise AttributeError("Task has no policy, actor or proprio_history observation group to configure.")
+
+
+def _apply_observation_ablation(observation) -> None:
+    """Apply requested policy-input ablations in place."""
+    if not args_cli.zero_depth_observation:
+        return
+    if "camera" not in observation:
+        raise KeyError("--zero_depth_observation requires a PIE observation group named 'camera'.")
+    observation["camera"].zero_()
 
 
 def _terrain_columns() -> dict[str, list[int]]:
@@ -327,6 +341,10 @@ def main() -> None:
         checkpoint,
         explicit=_TASK_WAS_EXPLICIT,
     )
+    if args_cli.zero_depth_observation and args_cli.task != _PIE_TASK:
+        raise ValueError("--zero_depth_observation is only supported by the PIE task.")
+    if args_cli.zero_depth_observation:
+        print("[INFO] PIE ablation enabled: camera depth-history observations will be zeroed.")
 
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -472,6 +490,7 @@ def main() -> None:
     for step in range(warmup_steps + eval_steps):
         wall_step_start = time.perf_counter()
         with torch.inference_mode():
+            _apply_observation_ablation(observation)
             actions = policy(observation)
             actions[fixed_course & (failed | succeeded)] = 0.0
             observation, _, dones, _ = env.step(actions)
