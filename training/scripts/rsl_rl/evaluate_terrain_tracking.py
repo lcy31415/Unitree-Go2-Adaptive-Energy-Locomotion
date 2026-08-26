@@ -26,6 +26,8 @@ import cli_args  # isort: skip
 
 _DEFAULT_TASK = "Unitree-Go2-Adaptive-Energy-Terrain-LPACRL"
 _PIE_TASK = "Unitree-Go2-Adaptive-Energy-LPACRL-PIE"
+_PIE_STAIRS_TASK = "Unitree-Go2-PIE-Stairs"
+_PIE_TASKS = {_PIE_TASK, _PIE_STAIRS_TASK}
 
 
 parser = argparse.ArgumentParser(description="Evaluate terrain-conditioned speed tracking.")
@@ -97,7 +99,12 @@ if args_cli.heading_control_gain < 0.0 or args_cli.max_heading_command <= 0.0:
     parser.error("Heading-control gain must be non-negative and its command limit must be positive.")
 if args_cli.task is None:
     checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
-    args_cli.task = _PIE_TASK if "lpacrl_pie" in checkpoint_hint else _DEFAULT_TASK
+    if "pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint:
+        args_cli.task = _PIE_STAIRS_TASK
+    elif "lpacrl_pie" in checkpoint_hint:
+        args_cli.task = _PIE_TASK
+    else:
+        args_cli.task = _DEFAULT_TASK
     print(f"[INFO] Inferred task {args_cli.task!r} from checkpoint path.")
 if args_cli.multi_robot_view:
     selected_visualizers = list(args_cli.visualizer or [])
@@ -124,6 +131,11 @@ from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_lpacrl_terrain_c
     LPACRL_TERRAIN_NAMES,
     LPACRL_TERRAINS_CFG,
 )
+from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_pie_stairs_env_cfg import (
+    PIE_STAIRS_COLUMNS_PER_TYPE,
+    PIE_STAIRS_TERRAIN_NAMES,
+    PIE_STAIRS_TERRAINS_CFG,
+)
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 
@@ -134,6 +146,7 @@ _FIXED_COURSE_GEOMETRY = {
     "slope_down": "slope_up",
     "random_rough": "random_rough",
 }
+_STAIRS_COURSE_GEOMETRY = {"stairs_up": "stairs_up", "stairs_down": "stairs_down"}
 
 
 def _as_torch(value):
@@ -152,9 +165,14 @@ def _checkpoint_is_pie(checkpoint: str) -> bool:
 def _resolve_task_for_checkpoint(task: str, checkpoint: str, *, explicit: bool) -> str:
     """Validate an explicit task or correct an inferred task using checkpoint contents."""
     checkpoint_is_pie = _checkpoint_is_pie(checkpoint)
-    task_is_pie = task == _PIE_TASK
+    task_is_pie = task in _PIE_TASKS
     if checkpoint_is_pie != task_is_pie:
-        expected = _PIE_TASK if checkpoint_is_pie else _DEFAULT_TASK
+        checkpoint_hint = checkpoint.lower()
+        expected = (
+            _PIE_STAIRS_TASK
+            if checkpoint_is_pie and ("pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint)
+            else _PIE_TASK if checkpoint_is_pie else _DEFAULT_TASK
+        )
         checkpoint_kind = "PIE" if checkpoint_is_pie else "non-PIE"
         if explicit:
             raise ValueError(
@@ -188,11 +206,17 @@ def _apply_observation_ablation(observation) -> None:
     observation["camera"].zero_()
 
 
-def _terrain_columns() -> dict[str, list[int]]:
+def _terrain_columns(task: str) -> dict[str, list[int]]:
     """Return the four deterministic geometry columns for every terrain family."""
+    if task == _PIE_STAIRS_TASK:
+        names = PIE_STAIRS_TERRAIN_NAMES
+        columns_per_type = PIE_STAIRS_COLUMNS_PER_TYPE
+    else:
+        names = LPACRL_TERRAIN_NAMES
+        columns_per_type = LPACRL_COLUMNS_PER_TYPE
     return {
-        name: list(range(index * LPACRL_COLUMNS_PER_TYPE, (index + 1) * LPACRL_COLUMNS_PER_TYPE))
-        for index, name in enumerate(LPACRL_TERRAIN_NAMES)
+        name: list(range(index * columns_per_type, (index + 1) * columns_per_type))
+        for index, name in enumerate(names)
     }
 
 
@@ -218,11 +242,15 @@ def _install_fixed_commands(env, commands: torch.Tensor) -> None:
     term._resample_command = MethodType(_resample_fixed, term)
 
 
-def _configure_deterministic_courses(env_cfg, terrain_names: list[str]) -> None:
+def _configure_deterministic_courses(
+    env_cfg,
+    terrain_names: list[str],
+    geometry_mapping: dict[str, str],
+) -> None:
     """Fix reset state and provide a full landing after fixed-course terrain segments."""
     generator_cfg = env_cfg.scene.terrain.terrain_generator
     for requested_name in terrain_names:
-        geometry_name = _FIXED_COURSE_GEOMETRY.get(requested_name)
+        geometry_name = geometry_mapping.get(requested_name)
         if geometry_name is not None:
             geometry_cfg = generator_cfg.sub_terrains[geometry_name]
             minimum_border_width = 2.0 if requested_name == "random_rough" else 1.0
@@ -313,17 +341,29 @@ def _plot_results(
 
 
 def main() -> None:
-    column_map = _terrain_columns()
+    checkpoint = str(Path(args_cli.checkpoint).expanduser().resolve())
+    if not os.path.isfile(checkpoint):
+        raise FileNotFoundError(checkpoint)
+    args_cli.task = _resolve_task_for_checkpoint(
+        args_cli.task,
+        checkpoint,
+        explicit=_TASK_WAS_EXPLICIT,
+    )
+    geometry_mapping = (
+        _STAIRS_COURSE_GEOMETRY if args_cli.task == _PIE_STAIRS_TASK else _FIXED_COURSE_GEOMETRY
+    )
+    terrain_cfg = PIE_STAIRS_TERRAINS_CFG if args_cli.task == _PIE_STAIRS_TASK else LPACRL_TERRAINS_CFG
+    column_map = _terrain_columns(args_cli.task)
     terrain_names = args_cli.terrain_types or list(column_map)
     unknown = sorted(set(terrain_names) - set(column_map))
     if unknown:
         raise ValueError(f"Unknown terrain types {unknown}; choose from {list(column_map)}")
     if any(not column_map[name] for name in terrain_names):
         raise ValueError("At least one selected terrain has no generated column.")
-    if any(name in _FIXED_COURSE_GEOMETRY for name in terrain_names) and min(args_cli.speeds) <= 0.0:
+    if any(name in geometry_mapping for name in terrain_names) and min(args_cli.speeds) <= 0.0:
         raise ValueError("Fixed +x course tests require positive commanded speeds.")
-    if min(args_cli.terrain_levels) < 0 or max(args_cli.terrain_levels) >= LPACRL_TERRAINS_CFG.num_rows:
-        raise ValueError(f"Terrain levels must be in [0, {LPACRL_TERRAINS_CFG.num_rows - 1}].")
+    if min(args_cli.terrain_levels) < 0 or max(args_cli.terrain_levels) >= terrain_cfg.num_rows:
+        raise ValueError(f"Terrain levels must be in [0, {terrain_cfg.num_rows - 1}].")
 
     cases = [
         (name, level, speed, replicate)
@@ -333,15 +373,7 @@ def main() -> None:
         for replicate in range(args_cli.envs_per_case)
     ]
     num_envs = len(cases)
-    checkpoint = str(Path(args_cli.checkpoint).expanduser().resolve())
-    if not os.path.isfile(checkpoint):
-        raise FileNotFoundError(checkpoint)
-    args_cli.task = _resolve_task_for_checkpoint(
-        args_cli.task,
-        checkpoint,
-        explicit=_TASK_WAS_EXPLICIT,
-    )
-    if args_cli.zero_depth_observation and args_cli.task != _PIE_TASK:
+    if args_cli.zero_depth_observation and args_cli.task not in _PIE_TASKS:
         raise ValueError("--zero_depth_observation is only supported by the PIE task.")
     if args_cli.zero_depth_observation:
         print("[INFO] PIE ablation enabled: camera depth-history observations will be zeroed.")
@@ -356,7 +388,13 @@ def main() -> None:
     env_cfg.scene.num_envs = num_envs
     env_cfg.episode_length_s = args_cli.warmup_s + args_cli.eval_s + 5.0
     env_cfg.curriculum = None
-    _configure_deterministic_courses(env_cfg, terrain_names)
+    # The evaluator records landing, lateral and heading outcomes itself.  A
+    # task-owned termination would auto-reset the robot before its terminal
+    # pose can be measured and would incorrectly turn success into failure.
+    for term_name in ("course_complete", "lateral_deviation", "heading_error"):
+        if hasattr(env_cfg.terminations, term_name):
+            setattr(env_cfg.terminations, term_name, None)
+    _configure_deterministic_courses(env_cfg, terrain_names, geometry_mapping)
     env_cfg.commands.base_velocity = UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(1.0e9, 1.0e9),
@@ -385,8 +423,8 @@ def main() -> None:
     levels = torch.tensor([case[1] for case in cases], dtype=torch.long, device=args_cli.device)
     columns = torch.tensor(
         [
-            column_map[_FIXED_COURSE_GEOMETRY.get(case[0], case[0])][
-                case[3] % len(column_map[_FIXED_COURSE_GEOMETRY.get(case[0], case[0])])
+            column_map[geometry_mapping.get(case[0], case[0])][
+                case[3] % len(column_map[geometry_mapping.get(case[0], case[0])])
             ]
             for case in cases
         ],
@@ -431,16 +469,16 @@ def main() -> None:
     eval_steps = round(args_cli.eval_s / dt)
 
     fixed_course = torch.tensor(
-        [case[0] in _FIXED_COURSE_GEOMETRY for case in cases], dtype=torch.bool, device=device
+        [case[0] in geometry_mapping for case in cases], dtype=torch.bool, device=device
     )
     centers = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types].to(device)
     obstacle_start = torch.full((num_envs,), torch.nan, device=device)
     obstacle_end = torch.full((num_envs,), torch.nan, device=device)
     finish_x = torch.full((num_envs,), torch.nan, device=device)
     for index, case in enumerate(cases):
-        if case[0] not in _FIXED_COURSE_GEOMETRY:
+        if case[0] not in geometry_mapping:
             continue
-        geometry_name = _FIXED_COURSE_GEOMETRY[case[0]]
+        geometry_name = geometry_mapping[case[0]]
         generator_cfg = terrain.cfg.terrain_generator
         geometry_cfg = generator_cfg.sub_terrains[geometry_name]
         border_width = float(geometry_cfg.border_width)
@@ -620,7 +658,7 @@ def main() -> None:
 
     rows = []
     for index, case in enumerate(cases):
-        is_fixed_course = case[0] in _FIXED_COURSE_GEOMETRY
+        is_fixed_course = case[0] in geometry_mapping
         success = bool(succeeded[index].item()) if is_fixed_course else bool(alive[index].item())
         if is_fixed_course:
             measured_speed = float(course_speed[index]) if success else float("nan")
@@ -641,7 +679,7 @@ def main() -> None:
         rows.append(
             {
                 "terrain_type": case[0],
-                "geometry_terrain": _FIXED_COURSE_GEOMETRY.get(case[0], case[0]),
+                "geometry_terrain": geometry_mapping.get(case[0], case[0]),
                 "terrain_level": case[1],
                 "command_vx": case[2],
                 "replicate": case[3],
@@ -721,7 +759,7 @@ def main() -> None:
             | {
                 "checkpoint": checkpoint,
                 "num_envs": num_envs,
-                "fixed_course_geometry_mapping": _FIXED_COURSE_GEOMETRY,
+                "fixed_course_geometry_mapping": geometry_mapping,
                 "fixed_course_speed_definition": "world +x displacement / course traversal time; successes only",
                 "fixed_course_heading_reference": (
                     "bearing from the robot to the course endpoint"

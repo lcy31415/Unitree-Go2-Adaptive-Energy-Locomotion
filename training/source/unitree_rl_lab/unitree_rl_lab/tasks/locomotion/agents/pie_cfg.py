@@ -133,3 +133,12 @@ class AdaptiveEnergyLPACRLPIERunnerCfg(RslRlOnPolicyRunnerCfg):
         successor_target_group="successor_target",
         successor_valid_group="successor_valid",
     )
+
+
+@configclass
+class AdaptiveEnergyPIEStairsRunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
+    """PIE training settings for the focused up/down-stair experiment."""
+
+    max_iterations = 20_000
+    save_interval = 250
+    experiment_name = "unitree_go2_adaptive_energy_pie_stairs"
