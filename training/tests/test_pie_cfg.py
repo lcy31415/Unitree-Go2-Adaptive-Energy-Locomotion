@@ -39,7 +39,10 @@ def test_pie_runner_contract() -> None:
     assert cfg.algorithm.foot_clearance_loss_coef == 1.0
     assert cfg.algorithm.height_reconstruction_loss_coef == 1.0
     assert cfg.algorithm.successor_loss_coef == 1.0
-    assert cfg.algorithm.kl_loss_coef == 4.0
+    assert cfg.algorithm.kl_loss_coef == 0.01
+    assert cfg.algorithm.kl_warmup_iterations == 500
+    assert cfg.algorithm.kl_capacity_warmup_iterations == 2500
+    assert cfg.algorithm.kl_capacity_max == 2.0
     assert cfg.algorithm.successor_target_group == "successor_target"
     assert cfg.algorithm.successor_valid_group == "successor_valid"
 

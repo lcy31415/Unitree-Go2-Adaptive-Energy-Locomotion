@@ -105,6 +105,19 @@ def test_complete_recurrent_rollout_update() -> None:
         "pie_height_reconstruction",
         "pie_successor",
         "pie_kl",
+        "pie_kl_total",
+        "pie_kl_objective",
+        "pie_kl_beta",
+        "pie_kl_capacity",
+        "pie_active_units",
+        "pie_mu_std",
+        "pie_posterior_std",
+        "pie_height_zero_z_delta",
+        "pie_successor_zero_z_delta",
+        "pie_policy_output_zero_z_delta",
+        "pie_vae_mu_grad_norm",
+        "pie_successor_decoder_grad_norm",
+        "pie_vae_mu_weight_norm",
     }
     assert set(losses) == expected_losses
     assert all(torch.isfinite(torch.tensor(value)) for value in losses.values())
@@ -123,3 +136,22 @@ def test_complete_recurrent_rollout_update() -> None:
         algorithm.actor.depth_encoder[0].weight,
     )
     assert restored_algorithm.optimizer.state_dict()["state"]
+
+
+def test_kl_capacity_schedule_and_checkpoint_state() -> None:
+    algorithm = make_algorithm()
+    assert algorithm._kl_schedule() == (0.0, 0.0)
+
+    algorithm.pie_update_count = algorithm.kl_warmup_iterations + algorithm.kl_capacity_warmup_iterations // 2
+    beta, capacity = algorithm._kl_schedule()
+    assert beta == algorithm.kl_loss_coef * 0.5
+    assert capacity == algorithm.kl_capacity_max * 0.5
+
+    saved = algorithm.save()
+    restored = make_algorithm()
+    restored.load(
+        saved,
+        {"actor": True, "critic": True, "optimizer": True, "iteration": True, "rnd": False},
+        strict=True,
+    )
+    assert restored.pie_update_count == algorithm.pie_update_count

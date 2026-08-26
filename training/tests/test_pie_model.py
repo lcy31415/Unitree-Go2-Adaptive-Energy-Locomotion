@@ -101,22 +101,75 @@ def test_auxiliary_outputs_losses_and_gradients() -> None:
 
     outputs = actor.auxiliary_outputs(obs, sample_latent=False)
     assert outputs["velocity"].shape == (2, 3)
-    assert outputs["map_latent"].shape == (2, 16)
     assert outputs["foot_clearance"].shape == (2, 4)
     assert outputs["mu"].shape == (2, 16)
     assert outputs["logvar"].shape == (2, 16)
-    assert outputs["latent"].shape == (2, 39)
+    assert outputs["z"].shape == (2, 16)
+    assert outputs["policy_latent"].shape == (2, 23)
+    assert outputs["latent"].shape == (2, 23)
     assert outputs["height_reconstruction"].shape == (2, 198)
     assert outputs["successor_prediction"].shape == (2, 45)
 
     losses = actor.auxiliary_losses(obs)
-    assert set(losses) == {"velocity", "foot_clearance", "height_reconstruction", "successor", "kl"}
+    assert set(losses) == {
+        "velocity",
+        "foot_clearance",
+        "height_reconstruction",
+        "successor",
+        "kl",
+        "kl_total",
+        "active_units",
+        "mu_std",
+        "posterior_std",
+        "height_zero_z_delta",
+        "successor_zero_z_delta",
+        "policy_output_zero_z_delta",
+    }
     assert all(loss.ndim == 0 and torch.isfinite(loss) for loss in losses.values())
     sum(losses.values()).backward()
     assert actor.depth_encoder[0].weight.grad is not None  # type: ignore[index,union-attr]
     assert torch.isfinite(actor.depth_encoder[0].weight.grad).all()  # type: ignore[index,union-attr]
     assert actor.memory.weight_ih_l0.grad is not None
     assert torch.isfinite(actor.memory.weight_ih_l0.grad).all()
+
+
+def test_vae_latent_is_the_only_auxiliary_decoder_input() -> None:
+    actor = make_actor(make_observations(2))
+
+    successor_first_linear = next(
+        module for module in actor.successor_decoder.modules() if isinstance(module, torch.nn.Linear)
+    )
+    height_first_linear = next(
+        module for module in actor.height_decoder.modules() if isinstance(module, torch.nn.Linear)
+    )
+    assert successor_first_linear.in_features == actor.vae_latent_dim == 16
+    assert height_first_linear.in_features == actor.vae_latent_dim
+    assert not hasattr(actor, "map_latent_head")
+
+
+def test_reconstruction_objectives_train_the_posterior() -> None:
+    torch.manual_seed(13)
+    obs = make_observations(4)
+    actor = make_actor(obs).train()
+
+    losses = actor.auxiliary_losses(obs)
+    (losses["height_reconstruction"] + losses["successor"]).backward()
+
+    assert actor.vae_mu_head.weight.grad is not None
+    assert actor.vae_logvar_head.weight.grad is not None
+    assert actor.vae_mu_head.weight.grad.norm() > 0
+    assert actor.vae_logvar_head.weight.grad.norm() > 0
+
+
+def test_policy_uses_posterior_mean_even_in_training_mode() -> None:
+    obs = make_observations(2)
+    actor = make_actor(obs).train()
+
+    actor.reset()
+    first = actor(obs)
+    actor.reset()
+    second = actor(obs)
+    torch.testing.assert_close(first, second)
 
 
 def test_successor_loss_ignores_invalid_transitions() -> None:

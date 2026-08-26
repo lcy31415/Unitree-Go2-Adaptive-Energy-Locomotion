@@ -37,7 +37,10 @@ class PIEPPOAlgorithmCfg(RslRlPpoAlgorithmCfg):
     foot_clearance_loss_coef: float = 1.0
     height_reconstruction_loss_coef: float = 1.0
     successor_loss_coef: float = 1.0
-    kl_loss_coef: float = 4.0
+    kl_loss_coef: float = 0.01
+    kl_warmup_iterations: int = 500
+    kl_capacity_warmup_iterations: int = 2500
+    kl_capacity_max: float = 2.0
     successor_target_group: str = "successor_target"
     successor_valid_group: str = "successor_valid"
 
@@ -85,7 +88,6 @@ class AdaptiveEnergyLPACRLPIERunnerCfg(RslRlOnPolicyRunnerCfg):
             "transformer_dropout": 0.0,
             "memory_hidden_dim": 128,
             "memory_num_layers": 1,
-            "map_latent_dim": 16,
             "vae_latent_dim": 16,
             "history_hidden_dims": (256, 128),
             "successor_decoder_dims": (64, 128),
@@ -124,7 +126,10 @@ class AdaptiveEnergyLPACRLPIERunnerCfg(RslRlOnPolicyRunnerCfg):
         foot_clearance_loss_coef=1.0,
         height_reconstruction_loss_coef=1.0,
         successor_loss_coef=1.0,
-        kl_loss_coef=4.0,
+        kl_loss_coef=0.01,
+        kl_warmup_iterations=500,
+        kl_capacity_warmup_iterations=2500,
+        kl_capacity_max=2.0,
         successor_target_group="successor_target",
         successor_valid_group="successor_valid",
     )

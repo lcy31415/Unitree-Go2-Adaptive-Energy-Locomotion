@@ -120,7 +120,6 @@ class PIEActorModel(nn.Module):
             )
 
         self.token_dim = int(cfg.get("token_dim", 64))
-        self.map_latent_dim = int(cfg.get("map_latent_dim", 16))
         self.vae_latent_dim = int(cfg.get("vae_latent_dim", 16))
         self.memory_hidden_dim = int(cfg.get("memory_hidden_dim", 128))
         self.memory_num_layers = int(cfg.get("memory_num_layers", 1))
@@ -169,25 +168,29 @@ class PIEActorModel(nn.Module):
         )
 
         self.velocity_head = nn.Linear(self.memory_hidden_dim, self.velocity_dim)
-        self.map_latent_head = nn.Linear(self.memory_hidden_dim, self.map_latent_dim)
         self.foot_clearance_head = nn.Linear(self.memory_hidden_dim, self.foot_dim)
         self.vae_mu_head = nn.Linear(self.memory_hidden_dim, self.vae_latent_dim)
         self.vae_logvar_head = nn.Linear(self.memory_hidden_dim, self.vae_latent_dim)
 
-        estimator_output_dim = self.velocity_dim + self.map_latent_dim + self.foot_dim + self.vae_latent_dim
-        self.actor_input_dim = self.proprio_dim + estimator_output_dim
+        # The policy receives deterministic explicit estimates and the posterior
+        # mean.  Auxiliary decoders deliberately receive only z: allowing the
+        # deterministic heads to bypass z makes posterior collapse the easiest
+        # solution, as observed in both the upstream and migrated checkpoints.
+        policy_latent_dim = self.velocity_dim + self.foot_dim + self.vae_latent_dim
+        self.actor_input_dim = self.proprio_dim + policy_latent_dim
         self.successor_decoder = MLP(
-            estimator_output_dim,
+            self.vae_latent_dim,
             self.successor_dim,
             tuple(int(value) for value in cfg.get("successor_decoder_dims", (64, 128))),
             activation,
         )
         self.height_decoder = MLP(
-            self.map_latent_dim,
+            self.vae_latent_dim,
             self.height_map_dim,
             tuple(int(value) for value in cfg.get("height_decoder_dims", (64, 128))),
             activation,
         )
+        self.successor_normalizer = EmpiricalNormalization(self.successor_dim)
 
         if distribution_cfg is None:
             self.distribution: Distribution | None = None
@@ -221,21 +224,47 @@ class PIEActorModel(nn.Module):
             masks=masks,
             hidden_state=hidden_state,
             update_internal=masks is None and hidden_state is None,
-            sample_latent=self.training,
+            sample_latent=False,
         )
-        actor_input = torch.cat(
-            (self.proprio_normalizer(obs[self.proprio_group]), estimates["latent"]),
-            dim=-1,
-        )
-        if masks is not None:
-            actor_input = unpad_trajectories(actor_input, masks)
-        actor_output = self.mlp(actor_input)
+        actor_output = self._actor_output(obs, estimates, masks)
         if self.distribution is None:
             return actor_output
         if stochastic_output:
             self.distribution.update(actor_output)
             return self.distribution.sample()
         return self.distribution.deterministic_output(actor_output)
+
+    def forward_with_auxiliary(
+        self,
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: torch.Tensor | None = None,
+        stochastic_output: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Evaluate policy and auxiliary heads from one shared posterior pass."""
+        estimates, _ = self._estimate(
+            obs[self.proprio_group],
+            obs[self.history_group],
+            obs[self.depth_group],
+            masks=masks,
+            hidden_state=hidden_state,
+            update_internal=False,
+            sample_latent=True,
+        )
+        actor_output = self._actor_output(obs, estimates, masks)
+        auxiliary = {**estimates, **self._decode_auxiliary(estimates)}
+        auxiliary["policy_output_zero_z_delta"] = self._policy_zero_z_delta(
+            obs,
+            estimates,
+            actor_output,
+            masks,
+        )
+        if self.distribution is None:
+            return actor_output, auxiliary
+        if stochastic_output:
+            self.distribution.update(actor_output)
+            return self.distribution.sample(), auxiliary
+        return self.distribution.deterministic_output(actor_output), auxiliary
 
     def auxiliary_outputs(
         self,
@@ -255,11 +284,7 @@ class PIEActorModel(nn.Module):
             update_internal=False,
             sample_latent=sample_latent,
         )
-        return {
-            **estimates,
-            "height_reconstruction": self.height_decoder(estimates["map_latent"]),
-            "successor_prediction": self.successor_decoder(estimates["latent"]),
-        }
+        return {**estimates, **self._decode_auxiliary(estimates)}
 
     def auxiliary_losses(
         self,
@@ -267,31 +292,103 @@ class PIEActorModel(nn.Module):
         masks: torch.Tensor | None = None,
         hidden_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Compute the five unweighted PIE estimator objectives."""
+        """Compute PIE objectives and latent-usage diagnostics."""
         estimates = self.auxiliary_outputs(
             obs,
             masks=masks,
             hidden_state=hidden_state,
             sample_latent=True,
         )
+        return self.auxiliary_losses_from_outputs(estimates, obs, masks)
+
+    def auxiliary_losses_from_outputs(
+        self,
+        estimates: dict[str, torch.Tensor],
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute losses from an already sampled posterior without a second pass."""
         mu = estimates["mu"]
         logvar = estimates["logvar"]
-        kl_per_sample = -0.5 * torch.mean(1.0 + logvar - mu.square() - logvar.exp(), dim=-1)
+        kl_per_dim = -0.5 * (1.0 + logvar - mu.square() - logvar.exp())
+        kl_per_sample = kl_per_dim.sum(dim=-1)
+        successor_mask = self._successor_mask(obs, masks)
+        normalized_successor = self.successor_normalizer(obs[self.successor_target_group])
+        successor = self._masked_mse(
+            estimates["successor_prediction"],
+            normalized_successor,
+            successor_mask,
+        )
+        height_reconstruction = self._masked_mse(
+            estimates["height_reconstruction"], obs[self.height_target_group], masks
+        )
+        zero_z = torch.zeros_like(estimates["z"])
         return {
             "velocity": self._masked_mse(estimates["velocity"], obs[self.velocity_target_group], masks),
             "foot_clearance": self._masked_mse(
                 estimates["foot_clearance"], obs[self.foot_target_group], masks
             ),
-            "height_reconstruction": self._masked_mse(
-                estimates["height_reconstruction"], obs[self.height_target_group], masks
+            "height_reconstruction": height_reconstruction,
+            "successor": successor,
+            "kl": self._masked_mean(kl_per_sample / self.vae_latent_dim, masks),
+            "kl_total": self._masked_mean(kl_per_sample, masks),
+            "active_units": self._active_units(mu, masks),
+            "mu_std": self._masked_feature_std(mu, masks).mean(),
+            "posterior_std": self._masked_mean(torch.exp(0.5 * logvar).mean(dim=-1), masks),
+            "height_zero_z_delta": (
+                self._masked_mse(
+                    self.height_decoder(zero_z), obs[self.height_target_group], masks
+                )
+                - height_reconstruction
+            ).detach(),
+            "successor_zero_z_delta": (
+                self._masked_mse(
+                    self.successor_decoder(zero_z), normalized_successor, successor_mask
+                )
+                - successor
+            ).detach(),
+            "policy_output_zero_z_delta": estimates.get(
+                "policy_output_zero_z_delta", torch.zeros((), device=mu.device)
             ),
-            "successor": self._masked_mse(
-                estimates["successor_prediction"],
-                obs[self.successor_target_group],
-                self._successor_mask(obs, masks),
-            ),
-            "kl": self._masked_mean(kl_per_sample, masks),
         }
+
+    def _decode_auxiliary(self, estimates: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        z = estimates["z"]
+        return {
+            "height_reconstruction": self.height_decoder(z),
+            "successor_prediction": self.successor_decoder(z),
+        }
+
+    def _actor_output(
+        self,
+        obs: TensorDict,
+        estimates: dict[str, torch.Tensor],
+        masks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        actor_input = torch.cat(
+            (self.proprio_normalizer(obs[self.proprio_group]), estimates["policy_latent"]),
+            dim=-1,
+        )
+        if masks is not None:
+            actor_input = unpad_trajectories(actor_input, masks)
+        return self.mlp(actor_input)
+
+    def _policy_zero_z_delta(
+        self,
+        obs: TensorDict,
+        estimates: dict[str, torch.Tensor],
+        actor_output: torch.Tensor,
+        masks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        zero_latent = torch.cat(
+            (estimates["velocity"], estimates["foot_clearance"], torch.zeros_like(estimates["mu"])),
+            dim=-1,
+        )
+        zero_input = torch.cat((self.proprio_normalizer(obs[self.proprio_group]), zero_latent), dim=-1)
+        if masks is not None:
+            zero_input = unpad_trajectories(zero_input, masks)
+        zero_output = self.mlp(zero_input)
+        return (actor_output - zero_output).square().mean().detach()
 
     def _successor_mask(self, obs: TensorDict, masks: torch.Tensor | None) -> torch.Tensor:
         successor_valid = obs[self.successor_valid_group].squeeze(-1).to(dtype=torch.bool)
@@ -334,7 +431,6 @@ class PIEActorModel(nn.Module):
                 self.memory_hidden = new_hidden
 
         velocity = self.velocity_head(memory_output)
-        map_latent = self.map_latent_head(memory_output)
         foot_clearance = self.foot_clearance_head(memory_output)
         mu = self.vae_mu_head(memory_output)
         logvar = self.vae_logvar_head(memory_output).clamp(-10.0, 5.0)
@@ -342,14 +438,15 @@ class PIEActorModel(nn.Module):
             z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
         else:
             z = mu
-        latent = torch.cat((velocity, map_latent, foot_clearance, z), dim=-1)
+        policy_latent = torch.cat((velocity, foot_clearance, mu), dim=-1)
         return {
             "velocity": velocity,
-            "map_latent": map_latent,
             "foot_clearance": foot_clearance,
             "mu": mu,
             "logvar": logvar,
-            "latent": latent,
+            "z": z,
+            "policy_latent": policy_latent,
+            "latent": policy_latent,
         }, new_hidden
 
     def _build_depth_encoder(self, cfg: dict[str, Any]) -> nn.Sequential:
@@ -413,6 +510,19 @@ class PIEActorModel(nn.Module):
     ) -> torch.Tensor:
         return cls._masked_mean((prediction - target).square().mean(dim=-1), masks)
 
+    @staticmethod
+    def _masked_feature_std(values: torch.Tensor, masks: torch.Tensor | None) -> torch.Tensor:
+        flattened = values.reshape(-1, values.shape[-1])
+        if masks is not None:
+            flattened = flattened[masks.reshape(-1).to(dtype=torch.bool)]
+        if flattened.shape[0] == 0:
+            return torch.zeros(values.shape[-1], device=values.device, dtype=values.dtype)
+        return flattened.var(dim=0, unbiased=False).sqrt()
+
+    @classmethod
+    def _active_units(cls, mu: torch.Tensor, masks: torch.Tensor | None) -> torch.Tensor:
+        return (cls._masked_feature_std(mu, masks).square() > 1.0e-2).sum().to(dtype=mu.dtype)
+
     def reset(
         self,
         dones: torch.Tensor | None = None,
@@ -443,6 +553,7 @@ class PIEActorModel(nn.Module):
         if self.obs_normalization:
             self.proprio_normalizer.update(obs[self.proprio_group])  # type: ignore[attr-defined]
             self.history_normalizer.update(obs[self.history_group])  # type: ignore[attr-defined]
+        self.successor_normalizer.update(obs[self.successor_target_group])
 
     @property
     def output_mean(self) -> torch.Tensor:
@@ -505,7 +616,6 @@ class _ExportPIEActor(nn.Module):
         self.cross_modal_transformer = copy.deepcopy(model.cross_modal_transformer)
         self.memory = copy.deepcopy(model.memory)
         self.velocity_head = copy.deepcopy(model.velocity_head)
-        self.map_latent_head = copy.deepcopy(model.map_latent_head)
         self.foot_clearance_head = copy.deepcopy(model.foot_clearance_head)
         self.vae_mu_head = copy.deepcopy(model.vae_mu_head)
         self.mlp = copy.deepcopy(model.mlp)
@@ -550,10 +660,9 @@ class _ExportPIEActor(nn.Module):
         memory_output, new_hidden = self.memory(memory_input.unsqueeze(0), memory_h)
         memory_output = memory_output.squeeze(0)
         velocity = self.velocity_head(memory_output)
-        map_latent = self.map_latent_head(memory_output)
         foot_clearance = self.foot_clearance_head(memory_output)
         z = self.vae_mu_head(memory_output)
-        latent = torch.cat((velocity, map_latent, foot_clearance, z), dim=-1)
+        latent = torch.cat((velocity, foot_clearance, z), dim=-1)
         actor_input = torch.cat(
             (self.proprio_normalizer(proprio), latent),
             dim=-1,

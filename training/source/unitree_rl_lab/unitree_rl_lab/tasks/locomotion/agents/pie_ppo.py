@@ -11,7 +11,7 @@ from .pie_model import PIEActorModel
 
 
 class PIEPPO(PPO):
-    """Optimize PPO and the five PIE estimator objectives jointly."""
+    """Optimize PPO and collapse-resistant PIE estimator objectives jointly."""
 
     def __init__(
         self,
@@ -21,7 +21,10 @@ class PIEPPO(PPO):
         foot_clearance_loss_coef: float = 1.0,
         height_reconstruction_loss_coef: float = 1.0,
         successor_loss_coef: float = 1.0,
-        kl_loss_coef: float = 4.0,
+        kl_loss_coef: float = 0.01,
+        kl_warmup_iterations: int = 500,
+        kl_capacity_warmup_iterations: int = 2500,
+        kl_capacity_max: float = 2.0,
         successor_target_group: str = "successor_target",
         successor_valid_group: str = "successor_valid",
         **kwargs,
@@ -38,8 +41,18 @@ class PIEPPO(PPO):
             "foot_clearance": float(foot_clearance_loss_coef),
             "height_reconstruction": float(height_reconstruction_loss_coef),
             "successor": float(successor_loss_coef),
-            "kl": float(kl_loss_coef),
         }
+        self.kl_loss_coef = float(kl_loss_coef)
+        self.kl_warmup_iterations = int(kl_warmup_iterations)
+        self.kl_capacity_warmup_iterations = int(kl_capacity_warmup_iterations)
+        self.kl_capacity_max = float(kl_capacity_max)
+        self.pie_update_count = 0
+        if self.kl_loss_coef < 0.0:
+            raise ValueError("PIE kl_loss_coef must be non-negative.")
+        if self.kl_warmup_iterations < 0 or self.kl_capacity_warmup_iterations <= 0:
+            raise ValueError("PIE KL warm-up durations must be non-negative and non-zero, respectively.")
+        if self.kl_capacity_max < 0.0:
+            raise ValueError("PIE kl_capacity_max must be non-negative.")
         self.successor_target_group = successor_target_group
         self.successor_valid_group = successor_valid_group
 
@@ -91,8 +104,23 @@ class PIEPPO(PPO):
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_weighted_auxiliary = 0.0
-        mean_auxiliary = {name: 0.0 for name in self.auxiliary_coefficients}
+        metric_names = (
+            *self.auxiliary_coefficients,
+            "kl",
+            "kl_total",
+            "kl_objective",
+            "active_units",
+            "mu_std",
+            "posterior_std",
+            "height_zero_z_delta",
+            "successor_zero_z_delta",
+            "policy_output_zero_z_delta",
+        )
+        mean_auxiliary = {name: 0.0 for name in metric_names}
+        mean_vae_mu_grad_norm = 0.0
+        mean_successor_decoder_grad_norm = 0.0
         mean_rnd_loss = 0.0 if self.rnd else None
+        kl_beta, kl_capacity = self._kl_schedule()
 
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
@@ -127,7 +155,7 @@ class PIEPPO(PPO):
                         batch.advantages.std() + 1.0e-8
                     )
 
-            self.actor(
+            _, auxiliary_outputs = self.actor.forward_with_auxiliary(
                 batch.observations,
                 masks=batch.masks,
                 hidden_state=batch.hidden_states[0],
@@ -186,20 +214,16 @@ class PIEPPO(PPO):
             else:
                 value_loss = (batch.returns - values).square().mean()
 
-            auxiliary_losses = self.actor.auxiliary_losses(
+            auxiliary_metrics = self.actor.auxiliary_losses_from_outputs(
+                auxiliary_outputs,
                 batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
+                batch.masks,
             )
-            if set(auxiliary_losses) != set(self.auxiliary_coefficients):
-                raise RuntimeError(
-                    "PIE auxiliary loss names do not match configured coefficients: "
-                    f"{sorted(auxiliary_losses)} != {sorted(self.auxiliary_coefficients)}."
-                )
+            kl_objective = (auxiliary_metrics["kl_total"] - kl_capacity).abs()
             weighted_auxiliary = sum(
-                self.auxiliary_coefficients[name] * auxiliary_losses[name]
+                self.auxiliary_coefficients[name] * auxiliary_metrics[name]
                 for name in self.auxiliary_coefficients
-            )
+            ) + kl_beta * kl_objective
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
@@ -217,6 +241,8 @@ class PIEPPO(PPO):
 
             self.optimizer.zero_grad()
             loss.backward()
+            vae_mu_grad_norm = self._module_grad_norm(self.actor.vae_mu_head)
+            successor_decoder_grad_norm = self._module_grad_norm(self.actor.successor_decoder)
             if self.rnd:
                 assert self.rnd_optimizer is not None
                 self.rnd_optimizer.zero_grad()
@@ -234,8 +260,11 @@ class PIEPPO(PPO):
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
             mean_weighted_auxiliary += weighted_auxiliary.item()
-            for name, value in auxiliary_losses.items():
+            auxiliary_metrics["kl_objective"] = kl_objective
+            for name, value in auxiliary_metrics.items():
                 mean_auxiliary[name] += value.item()
+            mean_vae_mu_grad_norm += vae_mu_grad_norm
+            mean_successor_decoder_grad_norm += successor_decoder_grad_norm
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
 
@@ -249,15 +278,48 @@ class PIEPPO(PPO):
         }
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
+        mean_vae_mu_grad_norm /= num_updates
+        mean_successor_decoder_grad_norm /= num_updates
 
         self.storage.clear()
+        self.pie_update_count += 1
         losses = {
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "pie_auxiliary": mean_weighted_auxiliary,
             **{f"pie_{name}": value for name, value in mean_auxiliary.items()},
+            "pie_kl_beta": kl_beta,
+            "pie_kl_capacity": kl_capacity,
+            "pie_vae_mu_grad_norm": mean_vae_mu_grad_norm,
+            "pie_successor_decoder_grad_norm": mean_successor_decoder_grad_norm,
+            "pie_vae_mu_weight_norm": self.actor.vae_mu_head.weight.detach().norm().item(),
         }
         if mean_rnd_loss is not None:
             losses["rnd"] = mean_rnd_loss
         return losses
+
+    def _kl_schedule(self) -> tuple[float, float]:
+        """Return the capacity-objective weight and target for this PPO update."""
+        elapsed = self.pie_update_count - self.kl_warmup_iterations
+        progress = min(max(elapsed / self.kl_capacity_warmup_iterations, 0.0), 1.0)
+        return self.kl_loss_coef * progress, self.kl_capacity_max * progress
+
+    @staticmethod
+    def _module_grad_norm(module: nn.Module) -> float:
+        squared_norm = 0.0
+        for parameter in module.parameters():
+            if parameter.grad is not None:
+                squared_norm += parameter.grad.detach().square().sum().item()
+        return squared_norm**0.5
+
+    def save(self) -> dict:
+        saved = super().save()
+        saved["pie_update_count"] = self.pie_update_count
+        return saved
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        load_iteration = super().load(loaded_dict, load_cfg, strict)
+        if load_iteration:
+            self.pie_update_count = int(loaded_dict.get("pie_update_count", loaded_dict.get("iter", 0)))
+        return load_iteration
