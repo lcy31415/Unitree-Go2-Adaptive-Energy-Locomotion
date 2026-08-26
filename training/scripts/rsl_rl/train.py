@@ -40,6 +40,18 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument(
+    "--show_pie_depth",
+    action="store_true",
+    default=False,
+    help="Open a live window showing the previous/current PIE depth frames for one environment.",
+)
+parser.add_argument(
+    "--pie_depth_env_index",
+    type=int,
+    default=0,
+    help="Environment index shown by --show_pie_depth (default: 0).",
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, choices=tasks, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -58,9 +70,11 @@ if args_cli.resume and args_cli.pretrained_actor is not None:
     parser.error("--resume and --pretrained_actor are mutually exclusive.")
 if args_cli.curriculum_checkpoint is not None and not args_cli.resume:
     parser.error("--curriculum_checkpoint requires --resume.")
+if args_cli.pie_depth_env_index < 0:
+    parser.error("--pie_depth_env_index must be non-negative.")
 
 # always enable cameras to record video
-if args_cli.video:
+if args_cli.video or args_cli.show_pie_depth:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -132,6 +146,110 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+class _PIEDepthDisplayWrapper(gym.Wrapper):
+    """Display the exact two-frame normalized depth history consumed by PIE."""
+
+    _DEPTH_SHAPE = (2, 60, 86)
+    _WINDOW_NAME = "PIE depth history (Q closes this window)"
+
+    def __init__(self, env: gym.Env, env_index: int = 0):
+        super().__init__(env)
+        if not 0 <= env_index < env.unwrapped.num_envs:
+            raise ValueError(
+                f"PIE depth display environment index must be in [0, {env.unwrapped.num_envs - 1}], "
+                f"got {env_index}."
+            )
+        try:
+            import matplotlib
+
+            matplotlib.use("TkAgg", force=True)
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise ImportError("--show_pie_depth requires Matplotlib and Tkinter.") from error
+        self._plt = plt
+        self._env_index = env_index
+        self._enabled = True
+        self._validated = False
+        self._figure, self._axes = plt.subplots(1, 2, figsize=(10.0, 4.0), constrained_layout=True)
+        self._figure.canvas.manager.set_window_title(self._WINDOW_NAME)
+        self._images = []
+        for axis, title in zip(self._axes, ("previous (t-0.1 s)", "current"), strict=True):
+            image = axis.imshow(
+                [[0.0]],
+                cmap="turbo",
+                vmin=0.0,
+                vmax=1.0,
+                interpolation="nearest",
+                aspect="auto",
+            )
+            axis.set_title(title)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            self._images.append(image)
+        self._figure.colorbar(
+            self._images[-1],
+            ax=self._axes,
+            label="proximity (near=1, 3 m cutoff=0)",
+            shrink=0.85,
+        )
+        self._figure.canvas.mpl_connect("key_press_event", self._on_key_press)
+        plt.show(block=False)
+
+    def _on_key_press(self, event) -> None:
+        if event.key in ("q", "escape"):
+            self._enabled = False
+            self._plt.close(self._figure)
+
+    def _display(self, observation) -> None:
+        if not self._enabled:
+            return
+        if "camera" not in observation:
+            raise KeyError(
+                "--show_pie_depth requires a PIE task whose observations contain the 'camera' group."
+            )
+        depth = observation["camera"]
+        if tuple(depth.shape[1:]) != (2 * 60 * 86,):
+            raise ValueError(
+                "PIE camera observation must have 10,320 flattened values per environment; "
+                f"got shape {tuple(depth.shape)}."
+            )
+        frames = depth[self._env_index].detach().reshape(self._DEPTH_SHAPE).float().cpu().numpy()
+        try:
+            for image, frame in zip(self._images, frames, strict=True):
+                # PIE stores metric distance / 3 m. Invert it for display so
+                # nearby obstacles have high, warm-colored values.
+                image.set_data(1.0 - frame.clip(0.0, 1.0))
+            self._figure.canvas.draw_idle()
+            self._figure.canvas.flush_events()
+        except Exception as error:
+            raise RuntimeError(
+                "Matplotlib could not update the PIE depth window. Run with a desktop/noVNC/X11 display "
+                "and do not use --headless, or omit --show_pie_depth."
+            ) from error
+        if not self._validated:
+            print(
+                f"[INFO] PIE depth window shows environment {self._env_index}: "
+                "previous/current normalized 60x86 frames (near=warm, far=dark)."
+            )
+            self._validated = True
+
+    def reset(self, **kwargs):
+        result = super().reset(**kwargs)
+        observation = result[0] if isinstance(result, tuple) else result
+        self._display(observation)
+        return result
+
+    def step(self, action):
+        result = super().step(action)
+        self._display(result[0])
+        return result
+
+    def close(self):
+        if self._enabled:
+            self._plt.close(self._figure)
+        super().close()
 
 
 class _AdaptiveEnergyRewardLoggingWrapper(gym.Wrapper):
@@ -305,6 +423,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     _focus_kit_camera_on_visible_robot(env)
+    if args_cli.show_pie_depth:
+        env = _PIEDepthDisplayWrapper(env, env_index=args_cli.pie_depth_env_index)
     lp_acrl_term = _get_lp_acrl_term(env)
 
     if hasattr(env.unwrapped, "reward_manager") and all(

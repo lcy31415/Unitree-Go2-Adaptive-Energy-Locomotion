@@ -43,6 +43,23 @@ gym.register(
 )
 
 gym.register(
+    id="Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_flat_lpacrl_pie_env_cfg:AdaptiveEnergyFlatLPACRLPIEEnvCfg"
+        ),
+        "play_env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_flat_lpacrl_pie_env_cfg:AdaptiveEnergyFlatLPACRLPIEPlayEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            "unitree_rl_lab.tasks.locomotion.agents.pie_cfg:AdaptiveEnergyFlatLPACRLPIERunnerCfg"
+        ),
+    },
+)
+
+gym.register(
     id="Unitree-Go2-Adaptive-Energy-Terrain-LPACRL",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
