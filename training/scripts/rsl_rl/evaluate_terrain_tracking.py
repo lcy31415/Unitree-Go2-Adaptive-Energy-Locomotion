@@ -29,7 +29,14 @@ _PIE_TASK = "Unitree-Go2-Adaptive-Energy-LPACRL-PIE"
 _PIE_STAIRS_TASK = "Unitree-Go2-PIE-Stairs"
 _PIE_STAIRS_LADDER_TASK = "Unitree-Go2-Adaptive-Energy-stairs-PIE"
 _PIE_FLAT_TASK = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE"
-_PIE_TASKS = {_PIE_TASK, _PIE_STAIRS_TASK, _PIE_STAIRS_LADDER_TASK, _PIE_FLAT_TASK}
+_PIE_MULTI_TERRAIN_TASK = "Unitree-Go2-Adaptive-Energy-PIE"
+_PIE_TASKS = {
+    _PIE_TASK,
+    _PIE_STAIRS_TASK,
+    _PIE_STAIRS_LADDER_TASK,
+    _PIE_FLAT_TASK,
+    _PIE_MULTI_TERRAIN_TASK,
+}
 _STAIRS_FAMILY = (_PIE_STAIRS_TASK, _PIE_STAIRS_LADDER_TASK)
 
 
@@ -108,6 +115,8 @@ if args_cli.task is None:
         args_cli.task = _PIE_STAIRS_LADDER_TASK
     elif "flat_lpacrl_pie" in checkpoint_hint:
         args_cli.task = _PIE_FLAT_TASK
+    elif "adaptive_energy_pie" in checkpoint_hint:
+        args_cli.task = _PIE_MULTI_TERRAIN_TASK
     elif "lpacrl_pie" in checkpoint_hint:
         args_cli.task = _PIE_TASK
     else:
@@ -143,6 +152,11 @@ from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_pie_stairs_env_c
     PIE_STAIRS_TERRAIN_NAMES,
     PIE_STAIRS_TERRAINS_CFG,
 )
+from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_pie_terrain_cfg import (
+    ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY,
+    ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES,
+    ADAPTIVE_ENERGY_PIE_TERRAINS_CFG,
+)
 from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_stairs_pie_env_cfg import (
     STAIRS_PIE_NUM_LEVELS,
 )
@@ -157,6 +171,14 @@ _FIXED_COURSE_GEOMETRY = {
     "random_rough": "random_rough",
 }
 _STAIRS_COURSE_GEOMETRY = {"stairs_up": "stairs_up", "stairs_down": "stairs_down"}
+_UNIFIED_COURSE_GEOMETRY = {
+    "stairs_up": "stairs_up",
+    "stairs_down": "stairs_down",
+    "slope_up": "slope_up",
+    "slope_down": "slope_down",
+    "random_rough": "random_rough",
+    "obstacles": "obstacles",
+}
 
 
 def _as_torch(value):
@@ -225,6 +247,9 @@ def _terrain_columns(task: str) -> dict[str, list[int]]:
     if task in _STAIRS_FAMILY:
         names = PIE_STAIRS_TERRAIN_NAMES
         columns_per_type = PIE_STAIRS_COLUMNS_PER_TYPE
+    elif task == _PIE_MULTI_TERRAIN_TASK:
+        names = ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES
+        columns_per_type = ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY
     else:
         names = LPACRL_TERRAIN_NAMES
         columns_per_type = LPACRL_COLUMNS_PER_TYPE
@@ -365,9 +390,19 @@ def main() -> None:
     )
     is_plane_task = args_cli.task == _PIE_FLAT_TASK
     geometry_mapping = (
-        _STAIRS_COURSE_GEOMETRY if args_cli.task in _STAIRS_FAMILY else _FIXED_COURSE_GEOMETRY
+        _STAIRS_COURSE_GEOMETRY
+        if args_cli.task in _STAIRS_FAMILY
+        else _UNIFIED_COURSE_GEOMETRY
+        if args_cli.task == _PIE_MULTI_TERRAIN_TASK
+        else _FIXED_COURSE_GEOMETRY
     )
-    terrain_cfg = PIE_STAIRS_TERRAINS_CFG if args_cli.task in _STAIRS_FAMILY else LPACRL_TERRAINS_CFG
+    terrain_cfg = (
+        PIE_STAIRS_TERRAINS_CFG
+        if args_cli.task in _STAIRS_FAMILY
+        else ADAPTIVE_ENERGY_PIE_TERRAINS_CFG
+        if args_cli.task == _PIE_MULTI_TERRAIN_TASK
+        else LPACRL_TERRAINS_CFG
+    )
     if args_cli.task == _PIE_STAIRS_LADDER_TASK:
         terrain_cfg.num_rows = STAIRS_PIE_NUM_LEVELS
     if is_plane_task:

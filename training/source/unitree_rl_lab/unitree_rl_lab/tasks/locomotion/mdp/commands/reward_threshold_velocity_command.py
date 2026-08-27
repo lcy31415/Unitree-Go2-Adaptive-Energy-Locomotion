@@ -576,3 +576,421 @@ class RewardThresholdVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     """Fraction of commands replaced by non-zero-yaw recovery anchors."""
     yaw_recovery_forward_range: tuple[float, float] = (0.3, 1.0)
     yaw_recovery_abs_yaw_range: tuple[float, float] = (0.2, 0.6)
+
+
+class MultiTerrainRewardThresholdVelocityCommand(RewardThresholdVelocityCommand):
+    """Independent reward-threshold velocity curriculum for every terrain family."""
+
+    cfg: MultiTerrainRewardThresholdVelocityCommandCfg
+
+    def __init__(self, cfg: MultiTerrainRewardThresholdVelocityCommandCfg, env):
+        super().__init__(cfg, env)
+        if not cfg.terrain_family_names:
+            raise ValueError("terrain_family_names must not be empty.")
+        if cfg.terrain_columns_per_family < 1:
+            raise ValueError("terrain_columns_per_family must be positive.")
+        if len(cfg.terrain_family_max_abs_vx) != len(cfg.terrain_family_names):
+            raise ValueError("Every terrain family needs one forward-speed envelope.")
+        if any(not envelope or any(value <= 0.0 for value in envelope) for envelope in cfg.terrain_family_max_abs_vx):
+            raise ValueError("Every family speed envelope must contain positive values.")
+
+        limits = (
+            cfg.limit_ranges.lin_vel_x,
+            cfg.limit_ranges.lin_vel_y,
+            cfg.limit_ranges.ang_vel_z,
+        )
+        initial_ranges = (cfg.ranges.lin_vel_x, cfg.ranges.lin_vel_y, cfg.ranges.ang_vel_z)
+        self.curricula = [
+            RewardThresholdCurriculum(env.device, limits, cfg.num_bins, initial_ranges)
+            for _ in cfg.terrain_family_names
+        ]
+        # Retain the public attribute for tooling that expects a command term
+        # to expose one representative curriculum.
+        self.curriculum = self.curricula[0]
+        family_count = len(cfg.terrain_family_names)
+        self._family_stages = [0] * family_count
+        self._family_stage_success_counts = [0] * family_count
+        self._family_terrain_level_ema: list[float | None] = [None] * family_count
+        self._family_terrain_gate_open = [cfg.terrain_gate_min_mean_level is None] * family_count
+        self._family_eligible_max_level: list[int | None] = [
+            cfg.curriculum_update_max_terrain_level
+        ] * family_count
+        self._family_last_gate_step = [-1] * family_count
+
+        for family_name in cfg.terrain_family_names:
+            for metric_name in (
+                "curriculum_stage",
+                "curriculum_stage_progress",
+                "curriculum_active_fraction",
+                "curriculum_mean_weight",
+                "terrain_gate_open",
+                "terrain_level_ema",
+                "curriculum_eligible_max_level",
+                "curriculum_error_vx",
+                "curriculum_error_vy",
+                "curriculum_error_yaw",
+            ):
+                self.metrics[f"{family_name}/{metric_name}"] = torch.zeros(
+                    self.num_envs, device=self.device
+                )
+
+    def _family_ids(self, env_ids: torch.Tensor) -> torch.Tensor:
+        terrain_types = self._env.scene.terrain.terrain_types[env_ids].long()
+        return torch.div(
+            terrain_types,
+            self.cfg.terrain_columns_per_family,
+            rounding_mode="floor",
+        ).clamp(max=len(self.cfg.terrain_family_names) - 1)
+
+    def _update_family_gate(self, family_index: int) -> tuple[bool, int | None]:
+        current_step = int(self._env.common_step_counter)
+        if self._family_last_gate_step[family_index] == current_step:
+            return (
+                self._family_terrain_gate_open[family_index],
+                self._family_eligible_max_level[family_index],
+            )
+        self._family_last_gate_step[family_index] = current_step
+
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        family_env_ids = all_env_ids[self._family_ids(all_env_ids) == family_index]
+        if family_env_ids.numel() == 0:
+            self._family_terrain_gate_open[family_index] = False
+            return False, self._family_eligible_max_level[family_index]
+
+        terrain_levels = self._env.scene.terrain.terrain_levels[family_env_ids].float()
+        current_mean = float(torch.mean(terrain_levels).item())
+        previous = self._family_terrain_level_ema[family_index]
+        decay = self.cfg.terrain_level_ema_decay
+        ema = current_mean if previous is None else decay * previous + (1.0 - decay) * current_mean
+        self._family_terrain_level_ema[family_index] = ema
+
+        gate_open = self._family_terrain_gate_open[family_index]
+        if self.cfg.terrain_gate_min_mean_level is None:
+            gate_open = True
+        elif gate_open:
+            close_level = self.cfg.terrain_gate_close_mean_level
+            if close_level is not None and ema < close_level:
+                gate_open = False
+        elif ema >= self.cfg.terrain_gate_min_mean_level:
+            gate_open = True
+        self._family_terrain_gate_open[family_index] = gate_open
+
+        eligible_max = self.cfg.curriculum_update_max_terrain_level
+        if self.cfg.curriculum_update_level_margin is not None:
+            terrain_max = max(len(self.cfg.terrain_family_max_abs_vx[family_index]) - 1, 0)
+            configured_max = terrain_max if eligible_max is None else eligible_max
+            eligible_max = min(
+                configured_max,
+                max(0, math.floor(ema) + self.cfg.curriculum_update_level_margin),
+            )
+        self._family_eligible_max_level[family_index] = eligible_max
+        self._publish_family_state(family_index)
+        return gate_open, eligible_max
+
+    def _publish_family_state(self, family_index: int) -> None:
+        name = self.cfg.terrain_family_names[family_index]
+        stage = self._family_stages[family_index]
+        curriculum = self.curricula[family_index]
+        allowed = curriculum.allowed_mask(stage)
+        progress = (
+            self._family_stage_success_counts[family_index] / self.cfg.stage_transition_successes
+            if stage < 2
+            else 1.0
+        )
+        self.metrics[f"{name}/curriculum_stage"][:] = float(stage)
+        self.metrics[f"{name}/curriculum_stage_progress"][:] = float(progress)
+        self.metrics[f"{name}/curriculum_active_fraction"][:] = (
+            curriculum.weights[allowed] > 0.0
+        ).float().mean()
+        self.metrics[f"{name}/curriculum_mean_weight"][:] = curriculum.weights[allowed].mean()
+        self.metrics[f"{name}/terrain_gate_open"][:] = float(
+            self._family_terrain_gate_open[family_index]
+        )
+        ema = self._family_terrain_level_ema[family_index]
+        self.metrics[f"{name}/terrain_level_ema"][:] = 0.0 if ema is None else ema
+        eligible = self._family_eligible_max_level[family_index]
+        self.metrics[f"{name}/curriculum_eligible_max_level"][:] = (
+            0.0 if eligible is None else float(eligible)
+        )
+        family_count = len(self.cfg.terrain_family_names)
+        self.metrics["curriculum_stage"][:] = sum(self._family_stages) / family_count
+        self.metrics["curriculum_stage_progress"][:] = sum(
+            (
+                self._family_stage_success_counts[index] / self.cfg.stage_transition_successes
+                if self._family_stages[index] < 2
+                else 1.0
+            )
+            for index in range(family_count)
+        ) / family_count
+        self.metrics["terrain_gate_open"][:] = sum(self._family_terrain_gate_open) / family_count
+        known_emas = [value for value in self._family_terrain_level_ema if value is not None]
+        self.metrics["terrain_level_ema"][:] = (
+            sum(known_emas) / len(known_emas) if known_emas else 0.0
+        )
+        known_eligible = [
+            value for value in self._family_eligible_max_level if value is not None
+        ]
+        self.metrics["curriculum_eligible_max_level"][:] = (
+            sum(known_eligible) / len(known_eligible) if known_eligible else 0.0
+        )
+        active_fractions = []
+        mean_weights = []
+        for index, family_curriculum in enumerate(self.curricula):
+            family_allowed = family_curriculum.allowed_mask(self._family_stages[index])
+            active_fractions.append(
+                float((family_curriculum.weights[family_allowed] > 0.0).float().mean().item())
+            )
+            mean_weights.append(float(family_curriculum.weights[family_allowed].mean().item()))
+        self.metrics["curriculum_active_fraction"][:] = sum(active_fractions) / family_count
+        self.metrics["curriculum_mean_weight"][:] = sum(mean_weights) / family_count
+
+    def _update_curriculum(self, env_ids: torch.Tensor):
+        family_ids = self._family_ids(env_ids)
+        for family_index, _ in enumerate(self.cfg.terrain_family_names):
+            family_reset_ids = env_ids[family_ids == family_index]
+            if family_reset_ids.numel() == 0:
+                continue
+            gate_open, eligible_max = self._update_family_gate(family_index)
+            valid = torch.logical_and(
+                self.bin_ids[family_reset_ids] >= 0,
+                self._segment_steps[family_reset_ids] > 0,
+            )
+            valid_env_ids = family_reset_ids[valid]
+            if not gate_open or valid_env_ids.numel() == 0:
+                continue
+            if eligible_max is not None:
+                levels = self._env.scene.terrain.terrain_levels[valid_env_ids]
+                valid_env_ids = valid_env_ids[levels <= eligible_max]
+                if valid_env_ids.numel() == 0:
+                    continue
+
+            expected_steps = self.cfg.resampling_time_range[0] / self._env.step_dt
+            segment_steps = self._segment_steps[valid_env_ids]
+            mean_abs_error = self._velocity_abs_error_sum[valid_env_ids] / segment_steps.unsqueeze(1)
+            commands = self.vel_command_b[valid_env_ids]
+            forward_tolerance = torch.maximum(
+                torch.full_like(commands[:, 0], self.cfg.forward_error_abs),
+                self.cfg.forward_error_rel * torch.abs(commands[:, 0]),
+            )
+            lateral_tolerance = torch.maximum(
+                torch.full_like(commands[:, 1], self.cfg.lateral_error_abs),
+                self.cfg.lateral_error_rel * torch.abs(commands[:, 1]),
+            )
+            yaw_tolerance = torch.maximum(
+                torch.full_like(commands[:, 2], self.cfg.angular_error_abs),
+                self.cfg.angular_error_rel * torch.abs(commands[:, 2]),
+            )
+            completed = segment_steps.float() >= self.cfg.minimum_segment_fraction * expected_steps
+            success = (
+                (mean_abs_error[:, 0] <= forward_tolerance)
+                & (mean_abs_error[:, 1] <= lateral_tolerance)
+                & (mean_abs_error[:, 2] <= yaw_tolerance)
+                & completed
+            )
+            stage = self._family_stages[family_index]
+            self.curricula[family_index].update(
+                self.bin_ids[valid_env_ids],
+                success,
+                self.cfg.local_range,
+                self.cfg.weight_increment,
+                stage,
+            )
+            self._update_family_stage(family_index, commands, success)
+            name = self.cfg.terrain_family_names[family_index]
+            self.metrics[f"{name}/curriculum_error_vx"][:] = mean_abs_error[:, 0].mean()
+            self.metrics[f"{name}/curriculum_error_vy"][:] = mean_abs_error[:, 1].mean()
+            self.metrics[f"{name}/curriculum_error_yaw"][:] = mean_abs_error[:, 2].mean()
+            self.metrics["curriculum_success"][valid_env_ids] = success.float()
+            self.metrics["curriculum_error_vx"][valid_env_ids] = mean_abs_error[:, 0]
+            self.metrics["curriculum_error_vy"][valid_env_ids] = mean_abs_error[:, 1]
+            self.metrics["curriculum_error_yaw"][valid_env_ids] = mean_abs_error[:, 2]
+            self._publish_family_state(family_index)
+
+    def _update_family_stage(
+        self, family_index: int, commands: torch.Tensor, success: torch.Tensor
+    ) -> None:
+        stage = self._family_stages[family_index]
+        if stage == 0:
+            at_frontier = commands[:, 0] >= self.cfg.linear_stage_threshold
+        elif stage == 1:
+            at_frontier = torch.abs(commands[:, 2]) >= self.cfg.angular_stage_threshold
+        else:
+            return
+        self._family_stage_success_counts[family_index] += int(
+            torch.sum(success & at_frontier).item()
+        )
+        if self._family_stage_success_counts[family_index] >= self.cfg.stage_transition_successes:
+            self._family_stages[family_index] += 1
+            self._family_stage_success_counts[family_index] = 0
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        self._update_curriculum(env_ids)
+        family_ids = self._family_ids(env_ids)
+        commands = torch.empty(len(env_ids), 3, device=self.device)
+        bin_ids = torch.full((len(env_ids),), -1, dtype=torch.long, device=self.device)
+        source_ids = torch.empty(len(env_ids), dtype=torch.long, device=self.device)
+
+        for family_index, _ in enumerate(self.cfg.terrain_family_names):
+            local_indices = torch.nonzero(family_ids == family_index, as_tuple=False).squeeze(-1)
+            if local_indices.numel() == 0:
+                continue
+            family_env_ids = env_ids[local_indices]
+            levels = self._env.scene.terrain.terrain_levels[family_env_ids].long()
+            envelope = torch.tensor(
+                self.cfg.terrain_family_max_abs_vx[family_index],
+                device=self.device,
+                dtype=torch.float,
+            )
+            max_abs_vx = envelope[levels.clamp(min=0, max=envelope.numel() - 1)]
+            family_commands, family_bins, family_sources = self.curricula[family_index].sample(
+                local_indices.numel(),
+                self._family_stages[family_index],
+                (
+                    self.cfg.frontier_sampling_probability,
+                    self.cfg.active_sampling_probability,
+                    self.cfg.replay_sampling_probability,
+                ),
+                self.cfg.frontier_bin_count,
+                max_abs_vx=max_abs_vx,
+            )
+            commands[local_indices] = family_commands
+            bin_ids[local_indices] = family_bins
+            source_ids[local_indices] = family_sources
+
+        recovery = torch.rand(len(env_ids), device=self.device) < self.cfg.yaw_recovery_sampling_probability
+        if torch.any(recovery):
+            count = int(recovery.sum().item())
+            vx_min, vx_max = self.cfg.yaw_recovery_forward_range
+            yaw_min, yaw_max = self.cfg.yaw_recovery_abs_yaw_range
+            recovery_vx = vx_min + torch.rand(count, device=self.device) * (vx_max - vx_min)
+            recovery_yaw = yaw_min + torch.rand(count, device=self.device) * (yaw_max - yaw_min)
+            signs = torch.where(
+                torch.rand(count, device=self.device) < 0.5,
+                -torch.ones(count, device=self.device),
+                torch.ones(count, device=self.device),
+            )
+            # Respect every family/level envelope for the injected anchors too.
+            recovery_env_ids = env_ids[recovery]
+            recovery_family_ids = family_ids[recovery]
+            for family_index in range(len(self.cfg.terrain_family_names)):
+                selected = recovery_family_ids == family_index
+                if not torch.any(selected):
+                    continue
+                levels = self._env.scene.terrain.terrain_levels[recovery_env_ids[selected]].long()
+                envelope = torch.tensor(
+                    self.cfg.terrain_family_max_abs_vx[family_index],
+                    device=self.device,
+                    dtype=torch.float,
+                )
+                limits = envelope[levels.clamp(min=0, max=envelope.numel() - 1)]
+                recovery_vx[selected] = torch.minimum(recovery_vx[selected], limits)
+            commands[recovery, 0] = recovery_vx
+            commands[recovery, 1] = 0.0
+            commands[recovery, 2] = recovery_yaw * signs
+            bin_ids[recovery] = -1
+            source_ids[recovery] = 3
+
+        self.vel_command_b[env_ids] = commands
+        self.bin_ids[env_ids] = bin_ids
+        self.metrics["sample_frontier"][env_ids] = (source_ids == 0).float()
+        self.metrics["sample_active_uniform"][env_ids] = (source_ids == 1).float()
+        self.metrics["sample_low_speed_replay"][env_ids] = (source_ids == 2).float()
+        self.metrics["sample_yaw_recovery"][env_ids] = (source_ids == 3).float()
+        self._velocity_abs_error_sum[env_ids] = 0.0
+        self._segment_steps[env_ids] = 0
+        planar_motion = (
+            torch.linalg.norm(self.vel_command_b[env_ids, :2], dim=1)
+            > self.cfg.zero_command_threshold
+        )
+        self.vel_command_b[env_ids, :2] *= planar_motion.unsqueeze(1)
+        self.is_standing_env[env_ids] = False
+
+    def state_dict(self) -> dict:
+        """Serialize every family curriculum and the current terrain allocation."""
+        terrain = self._env.scene.terrain
+        return {
+            "version": 1,
+            "family_names": tuple(self.cfg.terrain_family_names),
+            "weights": [curriculum.weights.detach().cpu() for curriculum in self.curricula],
+            "stages": list(self._family_stages),
+            "stage_success_counts": list(self._family_stage_success_counts),
+            "terrain_level_ema": list(self._family_terrain_level_ema),
+            "terrain_gate_open": list(self._family_terrain_gate_open),
+            "eligible_max_level": list(self._family_eligible_max_level),
+            "terrain_levels": terrain.terrain_levels.detach().cpu(),
+            "terrain_types": terrain.terrain_types.detach().cpu(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore family states and remap saved levels when env count changes."""
+        if tuple(state["family_names"]) != tuple(self.cfg.terrain_family_names):
+            raise ValueError("Checkpoint terrain families do not match the current task.")
+        for curriculum, weights in zip(self.curricula, state["weights"], strict=True):
+            if curriculum.weights.shape != weights.shape:
+                raise ValueError("Checkpoint velocity grid shape does not match the current task.")
+            curriculum.weights.copy_(weights.to(self.device))
+        self._family_stages = [int(value) for value in state["stages"]]
+        self._family_stage_success_counts = [int(value) for value in state["stage_success_counts"]]
+        self._family_terrain_level_ema = [
+            None if value is None else float(value) for value in state["terrain_level_ema"]
+        ]
+        self._family_terrain_gate_open = [bool(value) for value in state["terrain_gate_open"]]
+        self._family_eligible_max_level = list(state["eligible_max_level"])
+
+        terrain = self._env.scene.terrain
+        saved_levels = state.get("terrain_levels")
+        saved_types = state.get("terrain_types")
+        if saved_levels is not None and saved_types is not None:
+            saved_levels = saved_levels.to(self.device)
+            saved_types = saved_types.to(self.device)
+            current_ids = torch.arange(self.num_envs, device=self.device)
+            current_families = self._family_ids(current_ids)
+            saved_families = torch.div(
+                saved_types.long(), self.cfg.terrain_columns_per_family, rounding_mode="floor"
+            ).clamp(max=len(self.cfg.terrain_family_names) - 1)
+            for family_index in range(len(self.cfg.terrain_family_names)):
+                current = current_ids[current_families == family_index]
+                candidates = saved_levels[saved_families == family_index]
+                if current.numel() > 0 and candidates.numel() > 0:
+                    repeats = (current.numel() + candidates.numel() - 1) // candidates.numel()
+                    terrain.terrain_levels[current] = candidates.repeat(repeats)[: current.numel()]
+            terrain.env_origins[:] = terrain.terrain_origins[
+                terrain.terrain_levels, terrain.terrain_types
+            ]
+        for family_index in range(len(self.cfg.terrain_family_names)):
+            self._publish_family_state(family_index)
+
+    def resample_current_episodes(self) -> None:
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        self.bin_ids[:] = -1
+        self._segment_steps[:] = 0
+        self._resample_command(env_ids)
+
+    def csv_snapshot(self) -> tuple[tuple[str, ...], list[tuple]]:
+        rows = []
+        for family_index, name in enumerate(self.cfg.terrain_family_names):
+            curriculum = self.curricula[family_index]
+            for bin_id in range(curriculum.grid.shape[0]):
+                rows.append(
+                    (
+                        name,
+                        bin_id,
+                        *curriculum.grid[bin_id].detach().cpu().tolist(),
+                        float(curriculum.weights[bin_id].item()),
+                        self._family_stages[family_index],
+                    )
+                )
+        return ("terrain_family", "bin_id", "vx", "vy", "yaw", "weight", "stage"), rows
+
+
+@configclass
+class MultiTerrainRewardThresholdVelocityCommandCfg(RewardThresholdVelocityCommandCfg):
+    """Configuration for independent per-terrain reward-threshold curricula."""
+
+    class_type: type[MultiTerrainRewardThresholdVelocityCommand] = (
+        MultiTerrainRewardThresholdVelocityCommand
+    )
+    terrain_family_names: tuple[str, ...] = ()
+    terrain_columns_per_family: int = 1
+    terrain_family_max_abs_vx: tuple[tuple[float, ...], ...] = ()

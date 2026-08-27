@@ -1,5 +1,7 @@
 from .lp_acrl_velocity_command import LPACRLVelocityCommand, LPACRLVelocityCommandCfg  # noqa: F401
 from .reward_threshold_velocity_command import (  # noqa: F401
+    MultiTerrainRewardThresholdVelocityCommand,
+    MultiTerrainRewardThresholdVelocityCommandCfg,
     RewardThresholdCurriculum,
     RewardThresholdVelocityCommand,
     RewardThresholdVelocityCommandCfg,

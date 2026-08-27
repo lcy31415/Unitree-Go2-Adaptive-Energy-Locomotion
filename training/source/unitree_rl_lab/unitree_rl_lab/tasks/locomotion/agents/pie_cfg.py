@@ -165,3 +165,12 @@ class AdaptiveEnergyStairsPIERunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
     max_iterations = 20_000
     save_interval = 200
     experiment_name = "unitree_go2_adaptive_energy_stairs_pie"
+
+
+@configclass
+class AdaptiveEnergyPIERunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
+    """PIE settings for independent multi-terrain coupled curricula."""
+
+    max_iterations = 30_000
+    save_interval = 200
+    experiment_name = "unitree_go2_adaptive_energy_pie"

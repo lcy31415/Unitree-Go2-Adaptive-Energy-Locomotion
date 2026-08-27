@@ -361,6 +361,44 @@ def _attach_lp_acrl_checkpoint_state(runner, curriculum_term) -> None:
     runner.save = types.MethodType(save_with_curriculum, runner)
 
 
+def _get_stateful_command_curriculum(env):
+    """Return a command term that explicitly supports curriculum persistence."""
+    manager = getattr(env.unwrapped, "command_manager", None)
+    if manager is None or "base_velocity" not in manager.active_terms:
+        return None
+    term = manager.get_term("base_velocity")
+    return term if hasattr(term, "state_dict") and hasattr(term, "load_state_dict") else None
+
+
+def _attach_command_curriculum_checkpoint_state(runner, command_term) -> None:
+    """Embed the independent terrain/velocity curricula in RSL-RL checkpoints."""
+    original_save = runner.save
+
+    def save_with_command_curriculum(_runner, path: str, infos: dict | None = None):
+        merged_infos = dict(infos or {})
+        state = command_term.state_dict()
+        merged_infos["command_curriculum_state"] = state
+        result = original_save(path, merged_infos)
+        iteration = pathlib.Path(path).stem.removeprefix("model_")
+        torch.save(
+            state,
+            pathlib.Path(path).parent / f"command_curriculum_state_{iteration}.pt",
+        )
+        if hasattr(command_term, "csv_snapshot"):
+            snapshot_dir = pathlib.Path(path).parent / "command_curriculum"
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            header, rows = command_term.csv_snapshot()
+            with (snapshot_dir / f"{pathlib.Path(path).stem}.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as stream:
+                writer = csv.writer(stream)
+                writer.writerow(header)
+                writer.writerows(rows)
+        return result
+
+    runner.save = types.MethodType(save_with_command_curriculum, runner)
+
+
 def _focus_kit_camera_on_visible_robot(env) -> None:
     """Lock the Kit camera to the origin of an environment it actually shows."""
     unwrapped_env = env.unwrapped
@@ -441,6 +479,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.show_pie_depth:
         env = _PIEDepthDisplayWrapper(env, env_index=args_cli.pie_depth_env_index)
     lp_acrl_term = _get_lp_acrl_term(env)
+    command_curriculum_term = _get_stateful_command_curriculum(env)
 
     if hasattr(env.unwrapped, "reward_manager") and all(
         name in env.unwrapped.reward_manager.active_terms for name in ("Rlin", "Rang", "Renergy")
@@ -487,6 +526,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"[INFO] LP-ACRL: {lp_acrl_term.num_tasks} tasks, "
             f"{lp_acrl_term.episodes_per_stage} completed episodes/stage, checkpoint state enabled."
         )
+    if command_curriculum_term is not None:
+        _attach_command_curriculum_checkpoint_state(runner, command_curriculum_term)
+        family_count = len(command_curriculum_term.cfg.terrain_family_names)
+        print(
+            f"[INFO] Independent command curriculum: {family_count} terrain families, "
+            "checkpoint state enabled."
+        )
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
@@ -510,6 +556,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[INFO] Restored LP-ACRL state at stage {lp_acrl_term.stage}.")
             else:
                 print("[WARNING] Checkpoint has no LP-ACRL state; curriculum restarts uniformly.")
+        if command_curriculum_term is not None:
+            command_state = None
+            if args_cli.curriculum_checkpoint is not None:
+                curriculum_path = os.path.abspath(os.path.expanduser(args_cli.curriculum_checkpoint))
+                if not os.path.isfile(curriculum_path):
+                    raise FileNotFoundError(
+                        f"Command curriculum checkpoint does not exist: {curriculum_path}"
+                    )
+                command_state = torch.load(
+                    curriculum_path, weights_only=False, map_location="cpu"
+                )
+                print(f"[INFO] Loading standalone command curriculum: {curriculum_path}")
+            elif isinstance(checkpoint_infos, dict):
+                command_state = checkpoint_infos.get("command_curriculum_state")
+            if command_state is not None:
+                command_curriculum_term.load_state_dict(command_state)
+                # Loading terrain levels changes environment origins. Reset all
+                # robots once so their root poses and sensors move to the
+                # restored tiles before rollout collection begins.
+                env.unwrapped.reset()
+                print("[INFO] Restored all independent terrain/velocity curriculum states.")
+            else:
+                print(
+                    "[WARNING] Checkpoint has no independent command curriculum state; "
+                    "all families restart from their initial command cells."
+                )
     elif args_cli.pretrained_actor is not None:
         pretrained_actor_path = os.path.abspath(os.path.expanduser(args_cli.pretrained_actor))
         if not os.path.isfile(pretrained_actor_path):
