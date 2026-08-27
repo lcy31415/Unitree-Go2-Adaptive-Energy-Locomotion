@@ -27,7 +27,8 @@ import cli_args  # isort: skip
 _DEFAULT_TASK = "Unitree-Go2-Adaptive-Energy-Terrain-LPACRL"
 _PIE_TASK = "Unitree-Go2-Adaptive-Energy-LPACRL-PIE"
 _PIE_STAIRS_TASK = "Unitree-Go2-PIE-Stairs"
-_PIE_TASKS = {_PIE_TASK, _PIE_STAIRS_TASK}
+_PIE_FLAT_TASK = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE"
+_PIE_TASKS = {_PIE_TASK, _PIE_STAIRS_TASK, _PIE_FLAT_TASK}
 
 
 parser = argparse.ArgumentParser(description="Evaluate terrain-conditioned speed tracking.")
@@ -101,6 +102,8 @@ if args_cli.task is None:
     checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
     if "pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint:
         args_cli.task = _PIE_STAIRS_TASK
+    elif "flat_lpacrl_pie" in checkpoint_hint:
+        args_cli.task = _PIE_FLAT_TASK
     elif "lpacrl_pie" in checkpoint_hint:
         args_cli.task = _PIE_TASK
     else:
@@ -171,6 +174,8 @@ def _resolve_task_for_checkpoint(task: str, checkpoint: str, *, explicit: bool) 
         expected = (
             _PIE_STAIRS_TASK
             if checkpoint_is_pie and ("pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint)
+            else _PIE_FLAT_TASK
+            if checkpoint_is_pie and "flat_lpacrl_pie" in checkpoint_hint
             else _PIE_TASK if checkpoint_is_pie else _DEFAULT_TASK
         )
         checkpoint_kind = "PIE" if checkpoint_is_pie else "non-PIE"
@@ -349,17 +354,27 @@ def main() -> None:
         checkpoint,
         explicit=_TASK_WAS_EXPLICIT,
     )
+    is_plane_task = args_cli.task == _PIE_FLAT_TASK
     geometry_mapping = (
         _STAIRS_COURSE_GEOMETRY if args_cli.task == _PIE_STAIRS_TASK else _FIXED_COURSE_GEOMETRY
     )
     terrain_cfg = PIE_STAIRS_TERRAINS_CFG if args_cli.task == _PIE_STAIRS_TASK else LPACRL_TERRAINS_CFG
-    column_map = _terrain_columns(args_cli.task)
-    terrain_names = args_cli.terrain_types or list(column_map)
-    unknown = sorted(set(terrain_names) - set(column_map))
-    if unknown:
-        raise ValueError(f"Unknown terrain types {unknown}; choose from {list(column_map)}")
-    if any(not column_map[name] for name in terrain_names):
-        raise ValueError("At least one selected terrain has no generated column.")
+    if is_plane_task:
+        if set(args_cli.terrain_types or ["flat"]) != {"flat"}:
+            raise ValueError("The flat task evaluates on a single infinite plane; use --terrain_types flat.")
+        if args_cli.terrain_levels != [0]:
+            raise ValueError("The flat task has no terrain levels; use --terrain_levels 0.")
+        terrain_names = ["flat"]
+        args_cli.terrain_levels = [0]
+        column_map = {"flat": [0]}
+    else:
+        column_map = _terrain_columns(args_cli.task)
+        terrain_names = args_cli.terrain_types or list(column_map)
+        unknown = sorted(set(terrain_names) - set(column_map))
+        if unknown:
+            raise ValueError(f"Unknown terrain types {unknown}; choose from {list(column_map)}")
+        if any(not column_map[name] for name in terrain_names):
+            raise ValueError("At least one selected terrain has no generated column.")
     if any(name in geometry_mapping for name in terrain_names) and min(args_cli.speeds) <= 0.0:
         raise ValueError("Fixed +x course tests require positive commanded speeds.")
     if min(args_cli.terrain_levels) < 0 or max(args_cli.terrain_levels) >= terrain_cfg.num_rows:
@@ -394,7 +409,18 @@ def main() -> None:
     for term_name in ("course_complete", "lateral_deviation", "heading_error"):
         if hasattr(env_cfg.terminations, term_name):
             setattr(env_cfg.terminations, term_name, None)
-    _configure_deterministic_courses(env_cfg, terrain_names, geometry_mapping)
+    if is_plane_task:
+        # The plane task has no terrain generator; only zero the reset state so
+        # every evaluation starts deterministically at the env origin.
+        reset_base = env_cfg.events.reset_base
+        reset_base.params["pose_range"] = {
+            key: (0.0, 0.0) for key in ("x", "y", "z", "roll", "pitch", "yaw")
+        }
+        reset_base.params["velocity_range"] = {
+            key: (0.0, 0.0) for key in ("x", "y", "z", "roll", "pitch", "yaw")
+        }
+    else:
+        _configure_deterministic_courses(env_cfg, terrain_names, geometry_mapping)
     env_cfg.commands.base_velocity = UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(1.0e9, 1.0e9),
@@ -421,38 +447,46 @@ def main() -> None:
 
     commands = torch.zeros(num_envs, 3, device=args_cli.device)
     levels = torch.tensor([case[1] for case in cases], dtype=torch.long, device=args_cli.device)
-    columns = torch.tensor(
-        [
-            column_map[geometry_mapping.get(case[0], case[0])][
-                case[3] % len(column_map[geometry_mapping.get(case[0], case[0])])
-            ]
-            for case in cases
-        ],
-        dtype=torch.long,
-        device=args_cli.device,
-    )
+    if is_plane_task:
+        columns = torch.zeros(num_envs, dtype=torch.long, device=args_cli.device)
+    else:
+        columns = torch.tensor(
+            [
+                column_map[geometry_mapping.get(case[0], case[0])][
+                    case[3] % len(column_map[geometry_mapping.get(case[0], case[0])])
+                ]
+                for case in cases
+            ],
+            dtype=torch.long,
+            device=args_cli.device,
+        )
     commands[:, 0] = torch.tensor([case[2] for case in cases], device=args_cli.device)
 
     gym_env = gym.make(args_cli.task, cfg=env_cfg)
     terrain = gym_env.unwrapped.scene.terrain
-    terrain.terrain_levels[:] = levels.to(terrain.terrain_levels.device)
-    terrain.terrain_types[:] = columns.to(terrain.terrain_types.device)
-    selected_origins = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types].clone()
-    random_rough_mask = torch.tensor(
-        [case[0] == "random_rough" for case in cases],
-        dtype=torch.bool,
-        device=selected_origins.device,
-    )
-    if bool(random_rough_mask.any().item()):
-        generator_cfg = terrain.cfg.terrain_generator
-        rough_cfg = generator_cfg.sub_terrains["random_rough"]
-        effective_border = float(rough_cfg.border_width) + float(rough_cfg.horizontal_scale)
-        rough_start_x = selected_origins[:, 0] - 0.5 * float(generator_cfg.size[0]) + effective_border
-        selected_origins[random_rough_mask, 0] = (
-            rough_start_x[random_rough_mask] - args_cli.rough_runup_distance
+    if is_plane_task:
+        # A plane importer has no terrain levels/types; keep the default
+        # env-origins grid and evaluate pure velocity tracking.
+        pass
+    else:
+        terrain.terrain_levels[:] = levels.to(terrain.terrain_levels.device)
+        terrain.terrain_types[:] = columns.to(terrain.terrain_types.device)
+        selected_origins = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types].clone()
+        random_rough_mask = torch.tensor(
+            [case[0] == "random_rough" for case in cases],
+            dtype=torch.bool,
+            device=selected_origins.device,
         )
-        selected_origins[random_rough_mask, 2] = 0.0
-    terrain.env_origins[:] = selected_origins
+        if bool(random_rough_mask.any().item()):
+            generator_cfg = terrain.cfg.terrain_generator
+            rough_cfg = generator_cfg.sub_terrains["random_rough"]
+            effective_border = float(rough_cfg.border_width) + float(rough_cfg.horizontal_scale)
+            rough_start_x = selected_origins[:, 0] - 0.5 * float(generator_cfg.size[0]) + effective_border
+            selected_origins[random_rough_mask, 0] = (
+                rough_start_x[random_rough_mask] - args_cli.rough_runup_distance
+            )
+            selected_origins[random_rough_mask, 2] = 0.0
+        terrain.env_origins[:] = selected_origins
     _install_fixed_commands(gym_env, commands)
     gym_env.reset()
     if args_cli.multi_robot_view:
@@ -471,7 +505,11 @@ def main() -> None:
     fixed_course = torch.tensor(
         [case[0] in geometry_mapping for case in cases], dtype=torch.bool, device=device
     )
-    centers = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types].to(device)
+    centers = (
+        terrain.env_origins.clone().to(device)
+        if is_plane_task
+        else terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types].to(device)
+    )
     obstacle_start = torch.full((num_envs,), torch.nan, device=device)
     obstacle_end = torch.full((num_envs,), torch.nan, device=device)
     finish_x = torch.full((num_envs,), torch.nan, device=device)
