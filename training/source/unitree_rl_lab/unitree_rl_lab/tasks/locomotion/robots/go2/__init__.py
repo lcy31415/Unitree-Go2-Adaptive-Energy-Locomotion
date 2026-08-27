@@ -25,6 +25,23 @@ gym.register(
 )
 
 gym.register(
+    id="Unitree-Go2-Adaptive-Energy-Flat-PIE",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_flat_pie_env_cfg:AdaptiveEnergyFlatPIEEnvCfg"
+        ),
+        "play_env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_flat_pie_env_cfg:AdaptiveEnergyFlatPIEPlayEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            "unitree_rl_lab.tasks.locomotion.agents.pie_cfg:AdaptiveEnergyFlatPIERunnerCfg"
+        ),
+    },
+)
+
+gym.register(
     id="Unitree-Go2-Adaptive-Energy-Flat-LPACRL",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -107,6 +124,23 @@ gym.register(
         ),
         "rsl_rl_cfg_entry_point": (
             "unitree_rl_lab.tasks.locomotion.agents.pie_cfg:AdaptiveEnergyPIEStairsRunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Unitree-Go2-Adaptive-Energy-stairs-PIE",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_stairs_pie_env_cfg:AdaptiveEnergyStairsPIEEnvCfg"
+        ),
+        "play_env_cfg_entry_point": (
+            f"{__name__}.adaptive_energy_stairs_pie_env_cfg:AdaptiveEnergyStairsPIEPlayEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            "unitree_rl_lab.tasks.locomotion.agents.pie_cfg:AdaptiveEnergyStairsPIERunnerCfg"
         ),
     },
 )

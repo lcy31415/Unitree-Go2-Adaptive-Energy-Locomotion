@@ -115,6 +115,9 @@ class LPACRLCurriculum(ManagerTermBase):
         configured_stage_size = p["episodes_per_stage"]
         self.episodes_per_stage = self.num_envs if configured_stage_size is None else int(configured_stage_size)
         self.planar_zero_threshold = float(p["planar_zero_threshold"])
+        self.straight_task_probability = float(p.get("straight_task_probability", 0.0))
+        if not 0.0 <= self.straight_task_probability <= 1.0:
+            raise ValueError("straight_task_probability must be in [0, 1].")
         self.vx_edges = torch.tensor(p["vx_edges"], device=self.device)
         self.vy_edges = torch.tensor(p["vy_edges"], device=self.device)
         self.yaw_edges = torch.tensor(p["yaw_edges"], device=self.device)
@@ -136,10 +139,12 @@ class LPACRLCurriculum(ManagerTermBase):
                  episodes_per_stage: int | None, min_samples: int, beta: float, epsilon: float,
                  ema_alpha: float, planar_zero_threshold: float, beta_scale: float = 1.0,
                  lp_quantile: float = 0.75, max_probability: float = 0.05,
-                 probability_update_weight: float = 0.3) -> dict[str, torch.Tensor]:
+                 probability_update_weight: float = 0.3,
+                 straight_task_probability: float = 0.0) -> dict[str, torch.Tensor]:
         del command_name, reward_terms, vx_edges, vy_edges, yaw_edges
         del episodes_per_stage, min_samples, beta, epsilon, ema_alpha, planar_zero_threshold
         del beta_scale, lp_quantile, max_probability, probability_update_weight
+        del straight_task_probability
         ids = self._as_ids(env_ids)
         command = env.command_manager.get_term(self.command_name)
         if not isinstance(command, LPACRLVelocityCommand):
@@ -167,8 +172,8 @@ class LPACRLCurriculum(ManagerTermBase):
                     self.stage += 1
                     self.episodes_in_stage = 0
 
-        task_ids = self.sampler.sample(len(ids))
-        command.assign(ids, task_ids, self._sample_commands(task_ids))
+        task_ids, commands = self._sample_task_batch(len(ids))
+        command.assign(ids, task_ids, commands)
         return self.metrics()
 
     def _as_ids(self, env_ids: Sequence[int]) -> torch.Tensor:
@@ -187,6 +192,44 @@ class LPACRLCurriculum(ManagerTermBase):
         commands[torch.linalg.norm(commands[:, :2], dim=1) < self.planar_zero_threshold, :2] = 0.0
         return commands
 
+    def _sample_task_batch(self, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample LP tasks with an optional exact-straight anchor mixture.
+
+        The original magnitude grid samples the first lateral/yaw bins from
+        continuous intervals starting at zero, so exact ``vy=0, yaw=0`` has
+        measure zero.  A straight anchor reserves part of the batch for those
+        exact commands while retaining the corresponding ``(vy_bin=0,
+        yaw_bin=0)`` task ids for valid LP attribution.
+        """
+        task_ids = self.sampler.sample(count)
+        commands = self._sample_commands(task_ids)
+        if count == 0 or self.straight_task_probability <= 0.0:
+            self._last_straight_fraction = torch.zeros((), device=self.device)
+            return task_ids, commands
+
+        expected_count = self.straight_task_probability * count
+        straight_count = int(expected_count)
+        if torch.rand((), device=self.device).item() < expected_count - straight_count:
+            straight_count += 1
+        straight_mask = torch.zeros(count, dtype=torch.bool, device=self.device)
+        if straight_count > 0:
+            straight_mask[torch.randperm(count, device=self.device)[:straight_count]] = True
+        self._last_straight_fraction = straight_mask.float().mean()
+        if straight_count == 0:
+            return task_ids, commands
+
+        ny, nw = self.grid_shape[1], self.grid_shape[2]
+        straight_task_ids = torch.arange(self.grid_shape[0], device=self.device) * (ny * nw)
+        straight_weights = self.sampler.probabilities[straight_task_ids]
+        straight_weights = straight_weights / straight_weights.sum().clamp_min(1.0e-12)
+        selected = straight_task_ids[
+            torch.multinomial(straight_weights, straight_count, replacement=True)
+        ]
+        task_ids[straight_mask] = selected
+        commands[straight_mask] = self._sample_commands(selected)
+        commands[straight_mask, 1:] = 0.0
+        return task_ids, commands
+
     def metrics(self) -> dict[str, torch.Tensor]:
         p = self.sampler.probabilities
         entropy = -torch.sum(p * torch.log(p.clamp_min(1e-12)))
@@ -198,6 +241,12 @@ class LPACRLCurriculum(ManagerTermBase):
             "mean_abs_lp": self.sampler.learning_progress.abs().mean(),
             "coverage": (self.sampler.stage_sample_count > 0).float().mean(),
             "probability_kl": self.sampler.last_probability_kl,
+            "straight_anchor_probability": torch.tensor(
+                self.straight_task_probability, device=self.device
+            ),
+            "straight_anchor_fraction": getattr(
+                self, "_last_straight_fraction", torch.zeros((), device=self.device)
+            ),
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -214,7 +263,7 @@ class LPACRLCurriculum(ManagerTermBase):
     def resample_current_episodes(self) -> None:
         """Replace construction-time uniform commands after a checkpoint restore."""
         ids = torch.arange(self.num_envs, device=self.device)
-        task_ids = self.sampler.sample(self.num_envs)
+        task_ids, commands = self._sample_task_batch(self.num_envs)
         command = self._env.command_manager.get_term(self.command_name)
-        command.assign(ids, task_ids, self._sample_commands(task_ids))
+        command.assign(ids, task_ids, commands)
         command._resample(ids)

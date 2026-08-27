@@ -89,6 +89,37 @@ def adaptive_energy_tracking_ang_vel(
     return angular_weight * raw_reward
 
 
+def straight_command_yaw_rate_error(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    command_lateral_threshold: float = 1.0e-6,
+    command_yaw_threshold: float = 1.0e-6,
+    minimum_forward_speed: float = 0.2,
+    max_squared_error: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return a bounded yaw-rate error only for explicit straight commands.
+
+    LP-ACRL's continuous bins almost never produce exact zero lateral/yaw
+    commands.  The flat PIE task injects such anchor episodes and uses this
+    term to suppress a persistent turning bias without penalizing intentional
+    turning tasks.
+    """
+    if command_lateral_threshold < 0.0 or command_yaw_threshold < 0.0:
+        raise ValueError("Straight-command thresholds must be non-negative.")
+    if minimum_forward_speed < 0.0 or max_squared_error <= 0.0:
+        raise ValueError("minimum_forward_speed must be non-negative and max_squared_error positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    straight = (
+        (command[:, 0].abs() >= minimum_forward_speed)
+        & (command[:, 1].abs() <= command_lateral_threshold)
+        & (command[:, 2].abs() <= command_yaw_threshold)
+    )
+    squared_error = torch.square(asset.data.root_ang_vel_b[:, 2] - command[:, 2])
+    return straight.to(squared_error.dtype) * torch.clamp(squared_error, max=max_squared_error)
+
+
 def adaptive_energy_reward(
     env: ManagerBasedRLEnv,
     command_name: str = "base_velocity",
@@ -350,6 +381,138 @@ class bad_standstill(ManagerTermBase):
         grace = env.episode_length_buf >= round(grace_s / env.step_dt)
         sustained = self._violating_steps >= round(sustain_s / env.step_dt)
         return grace & sustained
+
+
+class command_stagnation_penalty(ManagerTermBase):
+    """Penalize persistent failure to move in the signed forward-command direction."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._violating_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._violating_steps[ids] = 0
+
+    def __call__(
+        self,
+        env,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        min_command: float = 0.3,
+        ratio: float = 0.25,
+        grace_s: float = 1.0,
+        sustain_s: float = 0.5,
+        penalty: float = 0.5,
+    ) -> torch.Tensor:
+        asset: Articulation = env.scene[asset_cfg.name]
+        command = env.command_manager.get_command(command_name)[:, 0]
+        vx = asset.data.root_lin_vel_b[:, 0]
+        aligned_vx = vx * torch.sign(command)
+        violating = (command.abs() >= min_command) & (aligned_vx < ratio * command.abs())
+        self._violating_steps = torch.where(
+            violating, self._violating_steps + 1, torch.zeros_like(self._violating_steps)
+        )
+        grace = env.episode_length_buf >= round(grace_s / env.step_dt)
+        sustained = self._violating_steps >= round(sustain_s / env.step_dt)
+        return torch.where(grace & sustained, -penalty, torch.zeros_like(vx))
+
+
+class bad_command_stagnation(ManagerTermBase):
+    """Terminate a robot that persistently ignores a meaningful forward command."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._violating_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._violating_steps[ids] = 0
+
+    def __call__(
+        self,
+        env,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        min_command: float = 0.3,
+        ratio: float = 0.25,
+        grace_s: float = 1.0,
+        sustain_s: float = 3.0,
+    ) -> torch.Tensor:
+        asset: Articulation = env.scene[asset_cfg.name]
+        command = env.command_manager.get_command(command_name)[:, 0]
+        vx = asset.data.root_lin_vel_b[:, 0]
+        aligned_vx = vx * torch.sign(command)
+        violating = (command.abs() >= min_command) & (aligned_vx < ratio * command.abs())
+        self._violating_steps = torch.where(
+            violating, self._violating_steps + 1, torch.zeros_like(self._violating_steps)
+        )
+        grace = env.episode_length_buf >= round(grace_s / env.step_dt)
+        sustained = self._violating_steps >= round(sustain_s / env.step_dt)
+        return grace & sustained
+
+
+class low_base_clearance(ManagerTermBase):
+    """Terminate sustained low base clearance measured relative to local terrain."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._violating_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._violating_steps[ids] = 0
+
+    def __call__(
+        self,
+        env,
+        sensor_cfg: SceneEntityCfg,
+        minimum_clearance: float = 0.20,
+        sustain_s: float = 0.20,
+    ) -> torch.Tensor:
+        sensor = env.scene.sensors[sensor_cfg.name]
+        sensor_pos = getattr(sensor.data.pos_w, "torch", sensor.data.pos_w)
+        ray_hits = getattr(sensor.data.ray_hits_w, "torch", sensor.data.ray_hits_w)
+        clearances = sensor_pos[:, 2].unsqueeze(1) - ray_hits[..., 2]
+        clearances = torch.where(
+            torch.isfinite(clearances), clearances, torch.full_like(clearances, float("inf"))
+        )
+        local_clearance = torch.median(clearances, dim=1).values
+        violating = local_clearance < minimum_clearance
+        self._violating_steps = torch.where(
+            violating, self._violating_steps + 1, torch.zeros_like(self._violating_steps)
+        )
+        sustained = self._violating_steps >= round(sustain_s / env.step_dt)
+        return sustained
+
+
+class persistent_body_contact(ManagerTermBase):
+    """Terminate sustained hip/thigh/calf contact while allowing brief stair brushes."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._violating_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._violating_steps[ids] = 0
+
+    def __call__(
+        self,
+        env,
+        sensor_cfg: SceneEntityCfg,
+        threshold: float = 5.0,
+        sustain_s: float = 0.20,
+    ) -> torch.Tensor:
+        sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+        forces = getattr(sensor.data.net_forces_w_history, "torch", sensor.data.net_forces_w_history)
+        selected = forces[:, :, sensor_cfg.body_ids, :]
+        violating = torch.any(torch.linalg.norm(selected, dim=-1) > threshold, dim=(1, 2))
+        self._violating_steps = torch.where(
+            violating, self._violating_steps + 1, torch.zeros_like(self._violating_steps)
+        )
+        sustained = self._violating_steps >= round(sustain_s / env.step_dt)
+        return sustained
 
 
 def stand_still(

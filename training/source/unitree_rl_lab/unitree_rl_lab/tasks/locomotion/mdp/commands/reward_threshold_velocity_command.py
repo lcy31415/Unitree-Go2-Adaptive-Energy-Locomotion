@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 
 import torch
 
@@ -98,8 +99,9 @@ class RewardThresholdCurriculum:
         stage: int,
         sampling_probabilities: tuple[float, float, float],
         frontier_bin_count: int,
+        max_abs_vx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mix frontier, active-uniform, and low-speed replay samples."""
+        """Mix curriculum sources while respecting per-environment speed limits."""
         probabilities = torch.tensor(sampling_probabilities, device=self.device, dtype=torch.float)
         if torch.any(probabilities < 0.0) or not torch.isclose(
             probabilities.sum(), torch.tensor(1.0, device=self.device), atol=1.0e-6
@@ -121,11 +123,31 @@ class RewardThresholdCurriculum:
             sample_indices = torch.nonzero(source_ids == source_id, as_tuple=False).squeeze(-1)
             if sample_indices.numel() == 0:
                 continue
-            candidates = torch.nonzero(source_mask, as_tuple=False).squeeze(-1)
-            if candidates.numel() == 0:
-                candidates = torch.nonzero(active, as_tuple=False).squeeze(-1)
-            candidate_indices = torch.randint(candidates.numel(), (sample_indices.numel(),), device=self.device)
-            bin_ids[sample_indices] = candidates[candidate_indices]
+            if max_abs_vx is None:
+                speed_limits = (None,)
+            else:
+                speed_limits = torch.unique(max_abs_vx[sample_indices])
+            for speed_limit in speed_limits:
+                if speed_limit is None:
+                    limited_indices = sample_indices
+                    candidate_mask = source_mask
+                else:
+                    limited_indices = sample_indices[
+                        torch.isclose(max_abs_vx[sample_indices], speed_limit)
+                    ]
+                    candidate_mask = source_mask & (self.grid[:, 0].abs() <= speed_limit + 1.0e-6)
+                candidates = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
+                if candidates.numel() == 0:
+                    fallback = active
+                    if speed_limit is not None:
+                        fallback = fallback & (self.grid[:, 0].abs() <= speed_limit + 1.0e-6)
+                    candidates = torch.nonzero(fallback, as_tuple=False).squeeze(-1)
+                if candidates.numel() == 0:
+                    raise RuntimeError("No active velocity cell satisfies the terrain speed limit.")
+                candidate_indices = torch.randint(
+                    candidates.numel(), (limited_indices.numel(),), device=self.device
+                )
+                bin_ids[limited_indices] = candidates[candidate_indices]
 
         noise = torch.rand(batch_size, 3, device=self.device) - 0.5
         if stage == 0:
@@ -138,6 +160,8 @@ class RewardThresholdCurriculum:
         elif stage == 1:
             commands[:, 1] = 0.0
         commands = torch.maximum(torch.minimum(commands, self.limits[:, 1]), self.limits[:, 0])
+        if max_abs_vx is not None:
+            commands[:, 0] = torch.clamp(commands[:, 0], min=-max_abs_vx, max=max_abs_vx)
         return commands, bin_ids, source_ids
 
     def update(
@@ -203,6 +227,27 @@ class RewardThresholdVelocityCommand(UniformVelocityCommand):
         self._skip_metrics_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._stage = 0
         self._stage_success_count = 0
+        self._terrain_level_ema: float | None = None
+        self._terrain_gate_open = cfg.terrain_gate_min_mean_level is None
+
+        if not 0.0 <= cfg.terrain_level_ema_decay < 1.0:
+            raise ValueError("terrain_level_ema_decay must be in [0, 1).")
+        if (
+            cfg.terrain_gate_close_mean_level is not None
+            and cfg.terrain_gate_min_mean_level is not None
+            and cfg.terrain_gate_close_mean_level >= cfg.terrain_gate_min_mean_level
+        ):
+            raise ValueError("Terrain gate close threshold must be below its open threshold.")
+        if not 0.0 <= cfg.yaw_recovery_sampling_probability < 1.0:
+            raise ValueError("yaw_recovery_sampling_probability must be in [0, 1).")
+        vx_min, vx_max = cfg.yaw_recovery_forward_range
+        yaw_min, yaw_max = cfg.yaw_recovery_abs_yaw_range
+        if not 0.0 <= vx_min <= vx_max or not 0.0 <= yaw_min <= yaw_max:
+            raise ValueError("Yaw-recovery command ranges must be ordered and non-negative.")
+        if cfg.terrain_conditioned_max_abs_vx is not None and any(
+            value <= 0.0 for value in cfg.terrain_conditioned_max_abs_vx
+        ):
+            raise ValueError("Every terrain-conditioned forward-speed limit must be positive.")
 
         self.metrics["curriculum_success"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["curriculum_active_fraction"] = torch.zeros(self.num_envs, device=self.device)
@@ -215,7 +260,10 @@ class RewardThresholdVelocityCommand(UniformVelocityCommand):
         self.metrics["sample_frontier"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sample_active_uniform"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sample_low_speed_replay"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["sample_yaw_recovery"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["terrain_gate_open"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["terrain_level_ema"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["curriculum_eligible_max_level"] = torch.zeros(self.num_envs, device=self.device)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         if env_ids is None:
@@ -296,22 +344,49 @@ class RewardThresholdVelocityCommand(UniformVelocityCommand):
             return
 
         terrain_gate_open = True
+        eligible_max_level = self.cfg.curriculum_update_max_terrain_level
         if self.cfg.terrain_gate_min_mean_level is not None:
             terrain = getattr(self._env.scene, "terrain", None)
             terrain_levels = getattr(terrain, "terrain_levels", None)
             if terrain_levels is None:
                 terrain_gate_open = False
             else:
-                terrain_gate_open = bool(
-                    torch.mean(terrain_levels.float()).item() >= self.cfg.terrain_gate_min_mean_level
-                )
+                current_mean_level = torch.mean(terrain_levels.float()).item()
+                if self._terrain_level_ema is None:
+                    self._terrain_level_ema = current_mean_level
+                else:
+                    decay = self.cfg.terrain_level_ema_decay
+                    self._terrain_level_ema = (
+                        decay * self._terrain_level_ema + (1.0 - decay) * current_mean_level
+                    )
+                if self._terrain_gate_open:
+                    close_level = self.cfg.terrain_gate_close_mean_level
+                    if close_level is not None and self._terrain_level_ema < close_level:
+                        self._terrain_gate_open = False
+                elif self._terrain_level_ema >= self.cfg.terrain_gate_min_mean_level:
+                    self._terrain_gate_open = True
+                terrain_gate_open = self._terrain_gate_open
+
+                if self.cfg.curriculum_update_level_margin is not None:
+                    dynamic_max = math.floor(self._terrain_level_ema) + self.cfg.curriculum_update_level_margin
+                    terrain_max = int(torch.max(terrain_levels).item())
+                    configured_max = (
+                        self.cfg.curriculum_update_max_terrain_level
+                        if self.cfg.curriculum_update_max_terrain_level is not None
+                        else terrain_max
+                    )
+                    eligible_max_level = min(configured_max, max(0, dynamic_max))
+        if self._terrain_level_ema is not None:
+            self.metrics["terrain_level_ema"][:] = self._terrain_level_ema
+        if eligible_max_level is not None:
+            self.metrics["curriculum_eligible_max_level"][:] = float(eligible_max_level)
         self.metrics["terrain_gate_open"][:] = float(terrain_gate_open)
         if not terrain_gate_open:
             return
 
-        if self.cfg.curriculum_update_max_terrain_level is not None:
+        if eligible_max_level is not None:
             terrain_levels = self._env.scene.terrain.terrain_levels[valid_env_ids]
-            eligible = terrain_levels <= self.cfg.curriculum_update_max_terrain_level
+            eligible = terrain_levels <= eligible_max_level
             valid_env_ids = valid_env_ids[eligible]
             if valid_env_ids.numel() == 0:
                 return
@@ -385,6 +460,15 @@ class RewardThresholdVelocityCommand(UniformVelocityCommand):
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         self._update_curriculum(env_ids)
 
+        max_abs_vx = None
+        if self.cfg.terrain_conditioned_max_abs_vx is not None:
+            terrain_levels = self._env.scene.terrain.terrain_levels[env_ids].long()
+            envelope = torch.tensor(
+                self.cfg.terrain_conditioned_max_abs_vx, device=self.device, dtype=torch.float
+            )
+            terrain_levels = terrain_levels.clamp(min=0, max=envelope.numel() - 1)
+            max_abs_vx = envelope[terrain_levels]
+
         commands, bin_ids, source_ids = self.curriculum.sample(
             len(env_ids),
             self._stage,
@@ -394,12 +478,36 @@ class RewardThresholdVelocityCommand(UniformVelocityCommand):
                 self.cfg.replay_sampling_probability,
             ),
             self.cfg.frontier_bin_count,
+            max_abs_vx=max_abs_vx,
         )
+
+        recovery_probability = self.cfg.yaw_recovery_sampling_probability
+        recovery = torch.rand(len(env_ids), device=self.device) < recovery_probability
+        if torch.any(recovery):
+            count = int(torch.sum(recovery).item())
+            vx_min, vx_max = self.cfg.yaw_recovery_forward_range
+            yaw_min, yaw_max = self.cfg.yaw_recovery_abs_yaw_range
+            recovery_vx = vx_min + torch.rand(count, device=self.device) * (vx_max - vx_min)
+            if max_abs_vx is not None:
+                recovery_vx = torch.minimum(recovery_vx, max_abs_vx[recovery])
+            recovery_yaw = yaw_min + torch.rand(count, device=self.device) * (yaw_max - yaw_min)
+            recovery_sign = torch.where(
+                torch.rand(count, device=self.device) < 0.5,
+                -torch.ones(count, device=self.device),
+                torch.ones(count, device=self.device),
+            )
+            commands[recovery, 0] = recovery_vx
+            commands[recovery, 1] = 0.0
+            commands[recovery, 2] = recovery_yaw * recovery_sign
+            # Recovery anchors train the policy but do not expand command bins.
+            bin_ids[recovery] = -1
+            source_ids[recovery] = 3
         self.vel_command_b[env_ids] = commands
         self.bin_ids[env_ids] = bin_ids
         self.metrics["sample_frontier"][env_ids] = (source_ids == 0).float()
         self.metrics["sample_active_uniform"][env_ids] = (source_ids == 1).float()
         self.metrics["sample_low_speed_replay"][env_ids] = (source_ids == 2).float()
+        self.metrics["sample_yaw_recovery"][env_ids] = (source_ids == 3).float()
         self._velocity_abs_error_sum[env_ids] = 0.0
         self._segment_steps[env_ids] = 0
 
@@ -454,5 +562,17 @@ class RewardThresholdVelocityCommandCfg(UniformLevelVelocityCommandCfg):
     zero_command_threshold: float = 0.2
     terrain_gate_min_mean_level: float | None = None
     """Mean terrain level required before command-bin weights can expand."""
+    terrain_gate_close_mean_level: float | None = None
+    """Lower EMA threshold that closes an already-open terrain gate."""
+    terrain_level_ema_decay: float = 0.0
+    """EMA decay for the global mean terrain level; zero uses the latest value."""
     curriculum_update_max_terrain_level: int | None = None
-    """Highest terrain level whose successful segments may expand command bins."""
+    """Absolute ceiling on terrain levels allowed to expand command bins."""
+    curriculum_update_level_margin: int | None = None
+    """If set, dynamic ceiling is ``floor(mean-level EMA) + margin``."""
+    terrain_conditioned_max_abs_vx: tuple[float, ...] | None = None
+    """Maximum absolute forward command for each terrain level."""
+    yaw_recovery_sampling_probability: float = 0.0
+    """Fraction of commands replaced by non-zero-yaw recovery anchors."""
+    yaw_recovery_forward_range: tuple[float, float] = (0.3, 1.0)
+    yaw_recovery_abs_yaw_range: tuple[float, float] = (0.2, 0.6)

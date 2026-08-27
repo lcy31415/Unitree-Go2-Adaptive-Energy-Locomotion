@@ -85,3 +85,16 @@ def make_pie_foot_scanner_cfg(foot_name: str, update_period: float = 0.02) -> Ra
         max_distance=0.6,
         debug_vis=False,
     )
+
+
+def make_pie_base_clearance_scanner_cfg(update_period: float = 0.02) -> RayCasterCfg:
+    """Create a compact world-downward scanner directly below the Go2 base."""
+    return RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        ray_alignment="world",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.02, size=(0.02, 0.02)),
+        mesh_prim_paths=["/World/ground"],
+        update_period=update_period,
+        max_distance=0.8,
+        debug_vis=False,
+    )

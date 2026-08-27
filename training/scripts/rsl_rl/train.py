@@ -270,19 +270,34 @@ class _AdaptiveEnergyRewardLoggingWrapper(gym.Wrapper):
         observations, reward, terminated, truncated, extras = self.env.step(action)
         log = extras.get("log")
         if log is not None and all(key in log for key in self._COMPONENT_KEYS):
-            log["Episode_Reward/Rtotal"] = sum(log[key] for key in self._COMPONENT_KEYS)
+            total = sum(log[key] for key in self._COMPONENT_KEYS)
+            # Task variants may add targeted terms on top of the released
+            # adaptive-energy decomposition. Keep Rtotal equal to the reward
+            # optimized by PPO whenever those optional terms are active.
+            total += log.get("Episode_Reward/command_stagnation", 0.0)
+            total += log.get("Episode_Reward/straight_yaw_rate_error", 0.0)
+            log["Episode_Reward/Rtotal"] = total
         if log is not None and self.concise_lpacrl:
             keep = {
                 "Episode_Reward/Rlin",
                 "Episode_Reward/Rang",
                 "Episode_Reward/Renergy",
+                "Episode_Reward/straight_yaw_rate_error",
                 "Episode_Reward/Rtotal",
+                "Metrics/base_velocity/error_vel_xy",
+                "Metrics/base_velocity/error_vel_yaw",
+                "Metrics/success_rate",
+                "Metrics/base_velocity/sample_yaw_recovery",
+                "Metrics/base_velocity/terrain_gate_open",
+                "Metrics/base_velocity/terrain_level_ema",
+                "Metrics/base_velocity/curriculum_eligible_max_level",
             }
             keep.update(key for key in log if key.startswith("Curriculum/lp_acrl/"))
             terrain_metrics = {
                 "Curriculum/terrain_levels/mean_level",
                 "Curriculum/terrain_levels/move_up_fraction",
                 "Curriculum/terrain_levels/move_down_fraction",
+                "Curriculum/terrain_levels/hold_fraction",
                 "Curriculum/terrain_levels/tracking_success",
                 "Curriculum/terrain_levels/survival_rate",
             }

@@ -149,3 +149,19 @@ class AdaptiveEnergyFlatLPACRLPIERunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
     """PIE training settings for flat adaptive-energy LP-ACRL."""
 
     experiment_name = "unitree_go2_adaptive_energy_flat_lpacrl_pie"
+
+
+@configclass
+class AdaptiveEnergyFlatPIERunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
+    """PIE settings for the original adaptive-energy velocity curriculum."""
+
+    experiment_name = "unitree_go2_adaptive_energy_flat_pie"
+
+
+@configclass
+class AdaptiveEnergyStairsPIERunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
+    """PIE settings for coupled original-velocity and stair curricula."""
+
+    max_iterations = 20_000
+    save_interval = 200
+    experiment_name = "unitree_go2_adaptive_energy_stairs_pie"

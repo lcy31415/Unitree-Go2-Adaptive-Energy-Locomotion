@@ -15,6 +15,7 @@ def adaptive_energy_terrain_levels(
     asset_cfg=None,
     minimum_expected_progress: float = 1.0,
     minimum_tracking_fraction: float = 0.8,
+    minimum_tracking_fraction_for_hold: float | None = None,
     move_up_distance_fraction: float = 0.5,
     move_down_expected_fraction: float = 0.5,
 ) -> dict[str, torch.Tensor | float]:
@@ -40,6 +41,7 @@ def adaptive_energy_terrain_levels(
             "max_level": torch.max(terrain.terrain_levels.float()),
             "move_up_fraction": 0.0,
             "move_down_fraction": 0.0,
+            "hold_fraction": 0.0,
             "tracking_success": 0.0,
             "survival_rate": 0.0,
         }
@@ -48,7 +50,15 @@ def adaptive_energy_terrain_levels(
     steps = episode_steps[valid].unsqueeze(1)
     mean_error = command_term._episode_velocity_abs_error_sum[valid_env_ids] / steps
     tracking_fraction = command_term._episode_within_tolerance_steps[valid_env_ids] / steps.squeeze(1)
+    if minimum_tracking_fraction_for_hold is None:
+        minimum_tracking_fraction_for_hold = minimum_tracking_fraction
+    if not 0.0 <= minimum_tracking_fraction_for_hold <= minimum_tracking_fraction <= 1.0:
+        raise ValueError(
+            "Terrain tracking fractions must satisfy "
+            "0 <= hold <= promotion <= 1."
+        )
     tracking_success = tracking_fraction >= minimum_tracking_fraction
+    tracking_failure = tracking_fraction < minimum_tracking_fraction_for_hold
 
     episode_length = env.episode_length_buf[valid_env_ids]
     survived = episode_length >= env.max_episode_length - 1
@@ -60,7 +70,8 @@ def adaptive_energy_terrain_levels(
 
     move_up = survived & tracking_success & progress_success
     progress_failure = moving & (progress < expected_progress * move_down_expected_fraction)
-    move_down = (~move_up) & ((~survived) | (~tracking_success) | progress_failure)
+    move_down = (~move_up) & ((~survived) | tracking_failure | progress_failure)
+    hold = ~(move_up | move_down)
     terrain.update_env_origins(valid_env_ids, move_up, move_down)
 
     return {
@@ -68,6 +79,7 @@ def adaptive_energy_terrain_levels(
         "max_level": torch.max(terrain.terrain_levels.float()),
         "move_up_fraction": torch.mean(move_up.float()),
         "move_down_fraction": torch.mean(move_down.float()),
+        "hold_fraction": torch.mean(hold.float()),
         "tracking_success": torch.mean(tracking_success.float()),
         "tracking_fraction": torch.mean(tracking_fraction),
         "survival_rate": torch.mean(survived.float()),
