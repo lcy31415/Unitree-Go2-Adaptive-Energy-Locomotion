@@ -27,8 +27,10 @@ import cli_args  # isort: skip
 _DEFAULT_TASK = "Unitree-Go2-Adaptive-Energy-Terrain-LPACRL"
 _PIE_TASK = "Unitree-Go2-Adaptive-Energy-LPACRL-PIE"
 _PIE_STAIRS_TASK = "Unitree-Go2-PIE-Stairs"
+_PIE_STAIRS_LADDER_TASK = "Unitree-Go2-Adaptive-Energy-stairs-PIE"
 _PIE_FLAT_TASK = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE"
-_PIE_TASKS = {_PIE_TASK, _PIE_STAIRS_TASK, _PIE_FLAT_TASK}
+_PIE_TASKS = {_PIE_TASK, _PIE_STAIRS_TASK, _PIE_STAIRS_LADDER_TASK, _PIE_FLAT_TASK}
+_STAIRS_FAMILY = (_PIE_STAIRS_TASK, _PIE_STAIRS_LADDER_TASK)
 
 
 parser = argparse.ArgumentParser(description="Evaluate terrain-conditioned speed tracking.")
@@ -102,6 +104,8 @@ if args_cli.task is None:
     checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
     if "pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint:
         args_cli.task = _PIE_STAIRS_TASK
+    elif "stairs_pie" in checkpoint_hint:
+        args_cli.task = _PIE_STAIRS_LADDER_TASK
     elif "flat_lpacrl_pie" in checkpoint_hint:
         args_cli.task = _PIE_FLAT_TASK
     elif "lpacrl_pie" in checkpoint_hint:
@@ -139,6 +143,9 @@ from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_pie_stairs_env_c
     PIE_STAIRS_TERRAIN_NAMES,
     PIE_STAIRS_TERRAINS_CFG,
 )
+from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_stairs_pie_env_cfg import (
+    STAIRS_PIE_NUM_LEVELS,
+)
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 
@@ -174,6 +181,8 @@ def _resolve_task_for_checkpoint(task: str, checkpoint: str, *, explicit: bool) 
         expected = (
             _PIE_STAIRS_TASK
             if checkpoint_is_pie and ("pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint)
+            else _PIE_STAIRS_LADDER_TASK
+            if checkpoint_is_pie and "stairs_pie" in checkpoint_hint
             else _PIE_FLAT_TASK
             if checkpoint_is_pie and "flat_lpacrl_pie" in checkpoint_hint
             else _PIE_TASK if checkpoint_is_pie else _DEFAULT_TASK
@@ -213,7 +222,7 @@ def _apply_observation_ablation(observation) -> None:
 
 def _terrain_columns(task: str) -> dict[str, list[int]]:
     """Return the four deterministic geometry columns for every terrain family."""
-    if task == _PIE_STAIRS_TASK:
+    if task in _STAIRS_FAMILY:
         names = PIE_STAIRS_TERRAIN_NAMES
         columns_per_type = PIE_STAIRS_COLUMNS_PER_TYPE
     else:
@@ -356,9 +365,11 @@ def main() -> None:
     )
     is_plane_task = args_cli.task == _PIE_FLAT_TASK
     geometry_mapping = (
-        _STAIRS_COURSE_GEOMETRY if args_cli.task == _PIE_STAIRS_TASK else _FIXED_COURSE_GEOMETRY
+        _STAIRS_COURSE_GEOMETRY if args_cli.task in _STAIRS_FAMILY else _FIXED_COURSE_GEOMETRY
     )
-    terrain_cfg = PIE_STAIRS_TERRAINS_CFG if args_cli.task == _PIE_STAIRS_TASK else LPACRL_TERRAINS_CFG
+    terrain_cfg = PIE_STAIRS_TERRAINS_CFG if args_cli.task in _STAIRS_FAMILY else LPACRL_TERRAINS_CFG
+    if args_cli.task == _PIE_STAIRS_LADDER_TASK:
+        terrain_cfg.num_rows = STAIRS_PIE_NUM_LEVELS
     if is_plane_task:
         if set(args_cli.terrain_types or ["flat"]) != {"flat"}:
             raise ValueError("The flat task evaluates on a single infinite plane; use --terrain_types flat.")
