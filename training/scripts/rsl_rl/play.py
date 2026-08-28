@@ -67,27 +67,81 @@ parser.add_argument(
     default=False,
     help="Continuously follow the robot root with the Kit viewport camera.",
 )
+parser.add_argument(
+    "--follow_distance",
+    type=float,
+    default=2.5,
+    help="Chase-camera distance behind the robot [m] (used with --follow_robot).",
+)
+parser.add_argument(
+    "--follow_height",
+    type=float,
+    default=1.1,
+    help="Chase-camera height above the robot [m] (used with --follow_robot).",
+)
+parser.add_argument(
+    "--duration_s",
+    type=float,
+    default=0.0,
+    help="Stop playback after this many simulated seconds (0 = run until the app closes).",
+)
+parser.add_argument(
+    "--course",
+    action="store_true",
+    default=False,
+    help=(
+        "Run one instrumented directional course attempt with success/fail verdicts "
+        "and obstacle-segment world speed. Requires --terrain_type, --num_envs 1 "
+        "and --command_vx."
+    ),
+)
+parser.add_argument(
+    "--max_lateral_deviation",
+    type=float,
+    default=1.0,
+    help="Course mode: maximum course-center error [m].",
+)
+parser.add_argument(
+    "--max_heading_error_deg",
+    type=float,
+    default=20.0,
+    help="Course mode: maximum absolute heading error [deg].",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-fixed_command_args = (args_cli.command_vx, args_cli.command_vy, args_cli.command_yaw)
-if any(value is not None for value in fixed_command_args) and not all(
-    value is not None for value in fixed_command_args
-):
-    parser.error("--command_vx, --command_vy, and --command_yaw must be provided together.")
 if args_cli.terrain_level is not None and args_cli.terrain_type is None:
     parser.error("--terrain_level requires --terrain_type.")
 if args_cli.terrain_variant != 0 and args_cli.terrain_type is None:
     parser.error("--terrain_variant requires --terrain_type.")
 if args_cli.terrain_type is not None:
-    if not all(value is not None for value in fixed_command_args):
-        parser.error("A fixed terrain demonstration also requires all three --command_* arguments.")
+    # A terrain demo fixes a directed course, so the lateral/yaw commands
+    # default to zero instead of being required alongside --command_vx.
+    if args_cli.command_vx is not None:
+        if args_cli.command_vy is None:
+            args_cli.command_vy = 0.0
+        if args_cli.command_yaw is None:
+            args_cli.command_yaw = 0.0
     if args_cli.num_envs is None:
         args_cli.num_envs = 1
     elif args_cli.num_envs != 1:
         parser.error("A fixed terrain demonstration currently requires --num_envs 1.")
+fixed_command_args = (args_cli.command_vx, args_cli.command_vy, args_cli.command_yaw)
+if any(value is not None for value in fixed_command_args) and not all(
+    value is not None for value in fixed_command_args
+):
+    parser.error("--command_vx, --command_vy, and --command_yaw must be provided together.")
+if args_cli.course:
+    if args_cli.terrain_type is None:
+        parser.error("--course requires --terrain_type.")
+    if args_cli.command_vx is None:
+        parser.error("--course requires --command_vx.")
+if args_cli.duration_s < 0.0:
+    parser.error("--duration_s must be non-negative.")
+if args_cli.max_lateral_deviation <= 0.0 or not 0.0 < args_cli.max_heading_error_deg <= 180.0:
+    parser.error("Course deviation limits must be positive and heading error must not exceed 180 degrees.")
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -99,6 +153,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import math
 import os
 import time
 import torch
@@ -124,7 +179,9 @@ import unitree_rl_lab.tasks  # noqa: F401
 from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 
-def _focus_kit_camera_on_visible_robot(env, follow_robot: bool = False) -> None:
+def _focus_kit_camera_on_visible_robot(
+    env, follow_robot: bool = False, distance: float = 2.5, height: float = 1.1
+) -> None:
     """Point the Kit viewport at a visible environment or follow its robot."""
     unwrapped_env = env.unwrapped
     camera_controller = getattr(unwrapped_env, "viewport_camera_controller", None)
@@ -148,9 +205,12 @@ def _focus_kit_camera_on_visible_robot(env, follow_robot: bool = False) -> None:
         # ViewportCameraController, so this offset moves with the robot while
         # remaining aligned with the world axes.
         camera_controller.update_view_to_asset_root("robot")
+        camera_controller.update_view_location(
+            eye=(-distance, -0.45 * distance, height), lookat=(0.45, 0.0, 0.35)
+        )
     else:
         camera_controller.update_view_to_env()
-    camera_controller.update_view_location(eye=(3.0, -3.0, 2.0), lookat=(0.0, 0.0, 0.45))
+        camera_controller.update_view_location(eye=(3.0, -3.0, 2.0), lookat=(0.0, 0.0, 0.45))
     target = "robot root" if follow_robot else f"visible environment env_{env_index}"
     print(f"[INFO] Kit camera is locked on {target}.")
 
@@ -249,6 +309,151 @@ def _install_fixed_terrain(env, terrain_type: str, terrain_level: int | None, te
     )
 
 
+# The CLI name describes the direction being tested. Moving from the center
+# toward +x descends a positive pyramid and ascends an inverted pyramid.
+_DIRECTIONAL_TERRAIN_GEOMETRY = {
+    "stairs_up": "stairs_down",
+    "stairs_down": "stairs_up",
+    "slope_up": "slope_down",
+    "slope_down": "slope_up",
+}
+
+
+def _as_torch(value):
+    return getattr(value, "torch", value)
+
+
+def _configure_deterministic_course(env_cfg, requested_terrain: str) -> None:
+    """Zero the reset state and widen landings for one fixed +x course attempt."""
+    geometry_terrain = _DIRECTIONAL_TERRAIN_GEOMETRY.get(requested_terrain, requested_terrain)
+    generator_cfg = env_cfg.scene.terrain.terrain_generator
+    if requested_terrain in _DIRECTIONAL_TERRAIN_GEOMETRY and generator_cfg is not None:
+        geometry_cfg = generator_cfg.sub_terrains[geometry_terrain]
+        # A full-width landing is required after the last step/slope. The
+        # training slopes use a 0.25 m border, which is too short for Go2.
+        geometry_cfg.border_width = max(float(geometry_cfg.border_width), 1.0)
+
+    reset_base = env_cfg.events.reset_base
+    reset_base.params["pose_range"] = {
+        key: (0.0, 0.0) for key in ("x", "y", "z", "roll", "pitch", "yaw")
+    }
+    reset_base.params["velocity_range"] = {
+        key: (0.0, 0.0) for key in ("x", "y", "z", "roll", "pitch", "yaw")
+    }
+    env_cfg.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+
+
+def _make_course_limits(terrain, level: int, column: int, geometry_terrain: str) -> dict[str, float]:
+    """Return world-space +x course boundaries for one pyramid terrain tile."""
+    generator_cfg = terrain.cfg.terrain_generator
+    geometry_cfg = generator_cfg.sub_terrains[geometry_terrain]
+    center = terrain.terrain_origins[level, column]
+    border_width = float(geometry_cfg.border_width)
+    # Height-field conversion allocates one extra horizontal-scale cell for
+    # its border; account for it so slope timing ends at the true surface edge.
+    effective_border = border_width + float(getattr(geometry_cfg, "horizontal_scale", 0.0))
+    obstacle_start = float(center[0]) + 0.5 * float(geometry_cfg.platform_width)
+    obstacle_end = float(center[0]) + 0.5 * float(generator_cfg.size[0]) - effective_border
+    return {
+        "spawn_x": float(center[0]),
+        "center_y": float(center[1]),
+        "obstacle_start": obstacle_start,
+        "obstacle_end": obstacle_end,
+        "finish_x": obstacle_end + min(0.30, 0.5 * border_width),
+    }
+
+
+def _heading_from_xyzw(quaternion) -> float:
+    """Return world yaw in radians for one Isaac Lab xyzw quaternion."""
+    qx, qy, qz, qw = (float(value) for value in quaternion)
+    return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+
+def _run_directional_course(env, policy, robot, course: dict[str, float]) -> None:
+    """Run one course attempt and report obstacle-only world-frame speed."""
+    observation = env.get_observations()
+    observation = observation[0] if isinstance(observation, tuple) else observation
+    step_dt = float(env.unwrapped.step_dt)
+    max_heading_error = math.radians(args_cli.max_heading_error_deg)
+    start_step = None
+    start_x = None
+    obstacle_end_step = None
+    obstacle_end_x = None
+    steps = 0
+
+    def fail(reason: str, x: float, lateral_error: float, heading_error: float) -> None:
+        progress = max(0.0, min(x, course["obstacle_end"]) - course["obstacle_start"])
+        total = course["obstacle_end"] - course["obstacle_start"]
+        print(
+            f"[COURSE] FAILED: {reason}; obstacle_progress={progress:.2f}/{total:.2f} m, "
+            f"lateral_error={lateral_error:+.2f} m, heading_error={math.degrees(heading_error):+.1f} deg."
+        )
+
+    with torch.inference_mode():
+        while simulation_app.is_running() and (
+            args_cli.duration_s <= 0.0 or steps * step_dt < args_cli.duration_s
+        ):
+            observation, _, dones, _ = env.step(policy(observation))
+            steps += 1
+            elapsed = steps * step_dt
+
+            position = _as_torch(robot.data.root_pos_w)[0]
+            quaternion = _as_torch(robot.data.root_quat_w)[0]
+            x = float(position[0])
+            lateral_error = float(position[1]) - course["center_y"]
+            heading_error = _heading_from_xyzw(quaternion)
+
+            if bool(dones[0].item()):
+                fail("fall/episode reset", x, lateral_error, heading_error)
+                return
+            if abs(lateral_error) > args_cli.max_lateral_deviation:
+                fail("lateral deviation limit exceeded", x, lateral_error, heading_error)
+                return
+            if abs(heading_error) > max_heading_error:
+                fail("heading error limit exceeded", x, lateral_error, heading_error)
+                return
+
+            if start_step is None and x >= course["obstacle_start"]:
+                start_step = steps
+                start_x = x
+                print(f"[COURSE] obstacle entry at t={elapsed:.2f}s, world_x={x:.2f}m")
+            if start_step is not None and obstacle_end_step is None and x >= course["obstacle_end"]:
+                obstacle_end_step = steps
+                obstacle_end_x = x
+            if x >= course["finish_x"]:
+                if start_step is None or obstacle_end_step is None:
+                    fail("invalid course timing", x, lateral_error, heading_error)
+                    return
+                traversal_time = (obstacle_end_step - start_step) * step_dt
+                world_displacement = obstacle_end_x - start_x
+                world_speed = world_displacement / max(traversal_time, step_dt)
+                print(
+                    f"[COURSE] SUCCESS: landing reached at t={elapsed:.2f}s; "
+                    f"obstacle_displacement={world_displacement:.2f}m, "
+                    f"obstacle_time={traversal_time:.2f}s, world_speed={world_speed:.2f}m/s, "
+                    f"lateral_error={lateral_error:+.2f}m, "
+                    f"heading_error={math.degrees(heading_error):+.1f}deg."
+                )
+                return
+
+            if steps % 50 == 0:
+                phase = "approach" if start_step is None else "obstacle/landing"
+                print(
+                    f"[COURSE] t={elapsed:5.1f}s phase={phase} world_x={x:.2f}m "
+                    f"lateral_error={lateral_error:+.2f}m "
+                    f"heading_error={math.degrees(heading_error):+.1f}deg"
+                )
+
+    position = _as_torch(robot.data.root_pos_w)[0]
+    quaternion = _as_torch(robot.data.root_quat_w)[0]
+    fail(
+        "course timeout",
+        float(position[0]),
+        float(position[1]) - course["center_y"],
+        _heading_from_xyzw(quaternion),
+    )
+
+
 def main():
     """Play with RSL-RL agent."""
     # parse configuration
@@ -270,6 +475,8 @@ def main():
     # command hook installed below supplies commands to LPACRLVelocityCommand.
     if args_cli.terrain_type is not None:
         env_cfg.curriculum = None
+    if args_cli.course:
+        _configure_deterministic_course(env_cfg, args_cli.terrain_type)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -301,7 +508,12 @@ def main():
         # Move the robot to the selected terrain origin immediately. Future
         # episode resets keep using this origin because curriculum is disabled.
         env.reset()
-    _focus_kit_camera_on_visible_robot(env, follow_robot=args_cli.follow_robot)
+    _focus_kit_camera_on_visible_robot(
+        env,
+        follow_robot=args_cli.follow_robot,
+        distance=args_cli.follow_distance,
+        height=args_cli.follow_height,
+    )
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -368,6 +580,24 @@ def main():
     if version("rsl-rl-lib").startswith("2.3."):
         obs, _ = env.get_observations()
     timestep = 0
+
+    if args_cli.course:
+        unwrapped_env = env.unwrapped
+        terrain = unwrapped_env.scene.terrain
+        columns = _terrain_columns_by_name(terrain.cfg.terrain_generator)
+        if args_cli.terrain_type not in columns:
+            available = ", ".join(columns)
+            raise ValueError(f"Unknown terrain type {args_cli.terrain_type!r}. Available: {available}.")
+        family_columns = columns[args_cli.terrain_type]
+        column = family_columns[args_cli.terrain_variant % len(family_columns)]
+        geometry_terrain = _DIRECTIONAL_TERRAIN_GEOMETRY.get(args_cli.terrain_type, args_cli.terrain_type)
+        course = _make_course_limits(terrain, args_cli.terrain_level or 0, column, geometry_terrain)
+        robot = unwrapped_env.scene["robot"]
+        _run_directional_course(env, policy, robot, course)
+        env.close()
+        return
+
+    steps = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -377,6 +607,10 @@ def main():
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
+        steps += 1
+        if args_cli.duration_s > 0.0 and steps * dt >= args_cli.duration_s:
+            print(f"[INFO] Reached --duration_s {args_cli.duration_s:.1f}s; stopping playback.")
+            break
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
