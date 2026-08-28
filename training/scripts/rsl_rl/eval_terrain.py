@@ -374,7 +374,7 @@ def _plot_results(
     vx_history=None,
 ) -> None:
     """Delegate plotting to the standalone, GPU-free plotting module."""
-    from plot_terrain_tracking import plot_results
+    from plot_terrain import plot_results
 
     plot_results(summary, terrain_names, levels, speeds, output_dir, cases=cases, dt=dt, vx_history=vx_history)
 
