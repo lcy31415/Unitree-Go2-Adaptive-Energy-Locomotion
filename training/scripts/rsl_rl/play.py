@@ -142,6 +142,25 @@ if args_cli.duration_s < 0.0:
     parser.error("--duration_s must be non-negative.")
 if args_cli.max_lateral_deviation <= 0.0 or not 0.0 < args_cli.max_heading_error_deg <= 180.0:
     parser.error("Course deviation limits must be positive and heading error must not exceed 180 degrees.")
+if args_cli.task is None:
+    if args_cli.checkpoint is None:
+        parser.error("--task is required when no --checkpoint is given for path inference.")
+    checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
+    if "flat_lpacrl_pie" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE"
+    elif "stairs_pie" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-stairs-PIE"
+    elif "adaptive_energy_pie" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-PIE"
+    elif "lpacrl_pie" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-LPACRL-PIE"
+    elif "flat_pie" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-Flat-PIE"
+    elif "flat_lpacrl" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL"
+    else:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-Terrain-LPACRL"
+    print(f"[INFO] Inferred task {args_cli.task!r} from checkpoint path.")
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
