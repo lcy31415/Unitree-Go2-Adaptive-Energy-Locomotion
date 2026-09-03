@@ -73,13 +73,13 @@ def test_stair_geometry_uses_ten_levels_and_matches_reference_shape():
 
     assert tuple(generator.sub_terrains) == PIE_STAIRS_TERRAIN_NAMES
     assert generator.num_rows == STAIRS_PIE_NUM_LEVELS == 10
-    assert reference_generator.num_rows == 4
+    assert reference_generator.num_rows == 10
     assert generator.num_cols == reference_generator.num_cols == 8
     assert generator.class_type is reference_generator.class_type
     for terrain in generator.sub_terrains.values():
         assert terrain.step_height_range == STAIRS_PIE_STEP_HEIGHT_RANGE == (0.03, 0.15)
     for terrain in reference_generator.sub_terrains.values():
-        assert terrain.step_height_range == (0.05, 0.15)
+        assert terrain.step_height_range == (0.03, 0.15)
     assert cfg.scene.terrain.max_init_terrain_level == 0
 
 

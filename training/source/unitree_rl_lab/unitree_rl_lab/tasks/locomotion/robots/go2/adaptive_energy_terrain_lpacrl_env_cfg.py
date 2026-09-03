@@ -1,4 +1,6 @@
-"""600-task LP-ACRL rough-terrain experiment with the flat-task guard set."""
+"""1500-task, ten-level LP-ACRL rough-terrain experiment."""
+
+import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -11,6 +13,7 @@ from unitree_rl_lab.tasks.locomotion import mdp
 
 from .adaptive_energy_env_cfg import AdaptiveEnergyEnvCfg, AdaptiveEnergyRewardsCfg
 from .adaptive_energy_lpacrl_terrain_cfg import (
+    ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
     LPACRL_COLUMNS_PER_TYPE,
     LPACRL_TERRAIN_NAMES,
     LPACRL_TERRAINS_CFG,
@@ -21,7 +24,7 @@ from .velocity_env_cfg import TerminationsCfg
 
 @configclass
 class AdaptiveEnergyTerrainLPACRLSceneCfg(AdaptiveEnergyTerrainSceneCfg):
-    """Six terrain families (flat plus five rough), four fixed geometry levels, four columns each."""
+    """Six terrain families, ten fixed geometry levels, four columns each."""
 
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -68,14 +71,14 @@ class AdaptiveEnergyTerrainLPACRLCurriculumCfg:
             "vx_edges": (0.0, 0.5, 1.0, 1.5, 2.0, 2.5),
             "yaw_edges": (0.0, 0.5, 1.0, 1.5, 2.0, 2.5),
             "terrain_names": LPACRL_TERRAIN_NAMES,
-            "num_levels": 4,
+            "num_levels": ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
             "columns_per_type": LPACRL_COLUMNS_PER_TYPE,
             "lateral_range": (0.0, 0.0),
-            # Sample density: 4096 episodes over 600 tasks gives ~7 episodes
-            # per task per stage, so min_samples=4 still lets most tasks
+            # Sample density: 4096 episodes over 1500 tasks gives ~2.7 episodes
+            # per task per stage, so min_samples=2 still lets most tasks
             # qualify for LP updates each stage.
             "episodes_per_stage": 4096,
-            "min_samples": 4,
+            "min_samples": 2,
             # Guard set converged on the flat LP-ACRL task: temperature
             # max(beta, beta_scale * Q75(|LP|)) with the floor near the LP
             # noise level (~0.003 at ~7 episodes/task/stage), a 5% single-task
@@ -149,6 +152,24 @@ class AdaptiveEnergyTerrainLPACRLEnvCfg(AdaptiveEnergyEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+
+        # Use the same directed-course reset contract as all newer PIE terrain
+        # tasks: start near the terrain origin (the center platform), face
+        # world +x, and remove reset velocity noise.  The narrow non-zero
+        # ranges retain mild robustness randomization without allowing a
+        # nominal upstairs episode to start facing back across the platform.
+        self.events.reset_base.params["pose_range"] = {
+            "x": (-0.15, 0.15),
+            "y": (-0.15, 0.15),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (-math.radians(5.0), math.radians(5.0)),
+        }
+        self.events.reset_base.params["velocity_range"] = {
+            key: (0.0, 0.0) for key in ("x", "y", "z", "roll", "pitch", "yaw")
+        }
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
 
 
 @configclass

@@ -30,13 +30,17 @@ _PIE_STAIRS_TASK = "Unitree-Go2-PIE-Stairs"
 _PIE_STAIRS_LADDER_TASK = "Unitree-Go2-Adaptive-Energy-stairs-PIE"
 _PIE_FLAT_TASK = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE"
 _PIE_MULTI_TERRAIN_TASK = "Unitree-Go2-Adaptive-Energy-PIE"
+_PIE_FLOODFILL_TASK = "Unitree-Go2-Adaptive-Energy-stairs-PIE-FloodFill"
+_PIE_FLOODFILL_TERRAINS = ("flat", "stairs_up", "stairs_down")
 _PIE_TASKS = {
     _PIE_TASK,
     _PIE_STAIRS_TASK,
     _PIE_STAIRS_LADDER_TASK,
     _PIE_FLAT_TASK,
     _PIE_MULTI_TERRAIN_TASK,
+    _PIE_FLOODFILL_TASK,
 }
+_MULTI_FAMILY_TASKS = (_PIE_MULTI_TERRAIN_TASK, _PIE_FLOODFILL_TASK)
 _STAIRS_FAMILY = (_PIE_STAIRS_TASK, _PIE_STAIRS_LADDER_TASK)
 
 
@@ -147,7 +151,9 @@ if args_cli.heading_control_gain < 0.0 or args_cli.max_heading_command <= 0.0:
     parser.error("Heading-control gain must be non-negative and its command limit must be positive.")
 if args_cli.task is None:
     checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
-    if "pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint:
+    if "floodfill" in checkpoint_hint or "flood-fill" in checkpoint_hint:
+        args_cli.task = _PIE_FLOODFILL_TASK
+    elif "pie_stairs" in checkpoint_hint or "pie-stairs" in checkpoint_hint:
         args_cli.task = _PIE_STAIRS_TASK
     elif "stairs_pie" in checkpoint_hint:
         args_cli.task = _PIE_STAIRS_LADDER_TASK
@@ -287,7 +293,7 @@ def _terrain_columns(task: str) -> dict[str, list[int]]:
     if task in _STAIRS_FAMILY:
         names = PIE_STAIRS_TERRAIN_NAMES
         columns_per_type = PIE_STAIRS_COLUMNS_PER_TYPE
-    elif task == _PIE_MULTI_TERRAIN_TASK:
+    elif task in _MULTI_FAMILY_TASKS:
         names = ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES
         columns_per_type = ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY
     else:
@@ -925,14 +931,14 @@ def main() -> None:
         _STAIRS_COURSE_GEOMETRY
         if args_cli.task in _STAIRS_FAMILY
         else _UNIFIED_COURSE_GEOMETRY
-        if args_cli.task == _PIE_MULTI_TERRAIN_TASK
+        if args_cli.task in _MULTI_FAMILY_TASKS
         else _FIXED_COURSE_GEOMETRY
     )
     terrain_cfg = (
         PIE_STAIRS_TERRAINS_CFG
         if args_cli.task in _STAIRS_FAMILY
         else ADAPTIVE_ENERGY_PIE_TERRAINS_CFG
-        if args_cli.task == _PIE_MULTI_TERRAIN_TASK
+        if args_cli.task in _MULTI_FAMILY_TASKS
         else LPACRL_TERRAINS_CFG
     )
     if args_cli.task == _PIE_STAIRS_LADDER_TASK:
@@ -947,7 +953,11 @@ def main() -> None:
         column_map = {"flat": [0]}
     else:
         column_map = _terrain_columns(args_cli.task)
-        terrain_names = args_cli.terrain_types or list(column_map)
+        terrain_names = args_cli.terrain_types or (
+            list(_PIE_FLOODFILL_TERRAINS)
+            if args_cli.task == _PIE_FLOODFILL_TASK
+            else list(column_map)
+        )
         unknown = sorted(set(terrain_names) - set(column_map))
         if unknown:
             raise ValueError(f"Unknown terrain types {unknown}; choose from {list(column_map)}")

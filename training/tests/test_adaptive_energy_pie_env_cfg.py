@@ -17,7 +17,10 @@ from unitree_rl_lab.tasks.locomotion.mdp.commands.reward_threshold_velocity_comm
     MultiTerrainRewardThresholdVelocityCommand,
     RewardThresholdVelocityCommand,
 )
+from unitree_rl_lab.tasks.locomotion.mdp.rewards import _terrain_conditioned_energy_weights
 from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_pie_env_cfg import (
+    ADAPTIVE_ENERGY_PIE_ENERGY_SCALES,
+    ADAPTIVE_ENERGY_PIE_FORWARD_ONLY,
     ADAPTIVE_ENERGY_PIE_SPEED_ENVELOPES,
     AdaptiveEnergyPIEEnvCfg,
     AdaptiveEnergyPIEPlayEnvCfg,
@@ -29,6 +32,7 @@ from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_pie_terrain_cfg 
     ADAPTIVE_ENERGY_PIE_ROUGHNESS_RANGE,
     ADAPTIVE_ENERGY_PIE_SLOPE_RANGE,
     ADAPTIVE_ENERGY_PIE_STEP_HEIGHT_RANGE,
+    ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS,
     ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES,
 )
 
@@ -47,7 +51,7 @@ def test_unified_pie_task_registration_and_runner():
     assert runner.save_interval == 200
 
 
-def test_seven_equal_terrain_families_have_ten_deterministic_levels():
+def test_seven_terrain_families_have_ten_deterministic_levels():
     cfg = AdaptiveEnergyPIEEnvCfg()
     generator = cfg.scene.terrain.terrain_generator
     assert tuple(generator.sub_terrains) == ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES
@@ -64,6 +68,48 @@ def test_seven_equal_terrain_families_have_ten_deterministic_levels():
         for column in range(generator.num_cols)
     ]
     assert [family_ids.count(index) for index in range(len(cumulative))] == [4] * 7
+
+
+def test_training_allocation_keeps_flat_anchor_and_all_terrain_families():
+    cfg = AdaptiveEnergyPIEEnvCfg()
+    term = cfg.events.allocate_terrain_families
+    assert term.func is mdp.allocate_terrain_families
+    assert term.params["family_weights"] == ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS
+    assert ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS == (
+        0.20,
+        0.25,
+        0.20,
+        0.075,
+        0.075,
+        0.15,
+        0.05,
+    )
+    assert math.isclose(sum(ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS), 1.0)
+
+    num_envs = 100
+    terrain = SimpleNamespace(
+        terrain_types=torch.zeros(num_envs, dtype=torch.long),
+        terrain_levels=torch.zeros(num_envs, dtype=torch.long),
+        terrain_origins=torch.zeros(10, 28, 3),
+        env_origins=torch.zeros(num_envs, 3),
+    )
+    env = SimpleNamespace(
+        num_envs=num_envs,
+        device="cpu",
+        scene=SimpleNamespace(terrain=terrain),
+    )
+    mdp.allocate_terrain_families(
+        env,
+        None,
+        ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS,
+        ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY,
+    )
+    family_ids = torch.div(
+        terrain.terrain_types,
+        ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY,
+        rounding_mode="floor",
+    )
+    assert torch.bincount(family_ids, minlength=7).tolist() == [20, 25, 20, 8, 7, 15, 5]
 
 
 def test_geometry_ranges_include_steeper_slopes():
@@ -84,6 +130,8 @@ def test_each_family_has_an_independent_velocity_curriculum_contract():
     assert command.terrain_family_names == ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES
     assert command.terrain_columns_per_family == 4
     assert command.terrain_family_max_abs_vx == ADAPTIVE_ENERGY_PIE_SPEED_ENVELOPES
+    assert command.terrain_family_forward_only == ADAPTIVE_ENERGY_PIE_FORWARD_ONLY
+    assert command.terrain_family_allocation_weights == ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS
     assert len(command.terrain_family_max_abs_vx) == 7
     assert all(len(envelope) == 10 for envelope in command.terrain_family_max_abs_vx)
     assert command.terrain_gate_min_mean_level == 2.0
@@ -95,7 +143,20 @@ def test_each_family_has_an_independent_velocity_curriculum_contract():
     assert command.replay_sampling_probability == 0.0
     assert command.yaw_recovery_sampling_probability == 0.15
     assert command.terrain_family_max_abs_vx[0] == (2.5,) * 10
+    assert command.terrain_family_max_abs_vx[1] == (
+        1.5, 1.5, 1.4, 1.3, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6
+    )
     assert command.terrain_family_max_abs_vx[-1][-1] == 0.6
+    assert command.terrain_family_forward_only == (True,) * 7
+
+    reward_cfg = AdaptiveEnergyPIEEnvCfg().rewards
+    for reward_term in (reward_cfg.Rlin, reward_cfg.Renergy, reward_cfg.adaptive_energy_residual):
+        assert reward_term.params["terrain_columns_per_family"] == 4
+        assert reward_term.params["terrain_energy_scale_by_family_level"] == (
+            ADAPTIVE_ENERGY_PIE_ENERGY_SCALES
+        )
+    assert ADAPTIVE_ENERGY_PIE_ENERGY_SCALES[0] == (1.0,) * 10
+    assert ADAPTIVE_ENERGY_PIE_ENERGY_SCALES[1][4:] == (0.5, 0.5, 0.5, 0.3, 0.3, 0.3)
 
 
 def test_multiterrain_level_curriculum_and_pie_interfaces():
@@ -106,7 +167,7 @@ def test_multiterrain_level_curriculum_and_pie_interfaces():
     assert term.params["columns_per_family"] == 4
     assert term.params["minimum_tracking_fraction"] == 0.7
     assert term.params["minimum_tracking_fraction_for_hold"] == 0.45
-    assert cfg.scene.pie_depth_camera.update_period == 0.1
+    assert cfg.scene.pie_depth_camera.update_period == 0.04
     assert cfg.scene.pie_base_clearance_scanner.update_period == 0.02
     assert cfg.observations.camera.depth_history.params["frame_history_length"] == 2
     assert cfg.observations.proprio_history.history_length == 10
@@ -116,9 +177,28 @@ def test_multiterrain_level_curriculum_and_pie_interfaces():
     ]
 
 
+def test_stair_energy_weight_is_transferred_to_tracking_at_high_levels():
+    terrain = SimpleNamespace(
+        terrain_types=torch.tensor([0, 4, 4, 4, 8]),
+        terrain_levels=torch.tensor([9, 3, 4, 7, 9]),
+    )
+    env = SimpleNamespace(scene=SimpleNamespace(terrain=terrain))
+    linear, energy = _terrain_conditioned_energy_weights(
+        env,
+        torch.full((5,), 0.4),
+        torch.full((5,), 0.4),
+        ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY,
+        ADAPTIVE_ENERGY_PIE_ENERGY_SCALES,
+    )
+    assert torch.allclose(energy, torch.tensor([0.4, 0.4, 0.2, 0.12, 0.12]))
+    assert torch.allclose(linear, torch.tensor([0.4, 0.4, 0.6, 0.68, 0.68]))
+    assert torch.allclose(linear + energy, torch.full((5,), 0.8))
+
+
 def test_play_configuration_disables_learning_and_corruption():
     play = AdaptiveEnergyPIEPlayEnvCfg()
     assert play.scene.num_envs == len(ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES)
+    assert play.events.allocate_terrain_families is None
     assert play.curriculum is None
     assert play.events.push_robot is None
     assert play.commands.base_velocity.terrain_gate_min_mean_level is None
@@ -204,6 +284,8 @@ def test_multiterrain_sampling_is_isolated_and_respects_each_envelope(monkeypatc
         selected = family_ids == family_index
         limits = torch.tensor(envelope)[env.scene.terrain.terrain_levels[selected]]
         assert torch.all(command.vel_command_b[selected, 0].abs() <= limits + 1.0e-6)
+        if ADAPTIVE_ENERGY_PIE_FORWARD_ONLY[family_index]:
+            assert torch.all(command.vel_command_b[selected, 0] >= 0.0)
     assert not torch.any(command.metrics["sample_low_speed_replay"] > 0.0)
 
 

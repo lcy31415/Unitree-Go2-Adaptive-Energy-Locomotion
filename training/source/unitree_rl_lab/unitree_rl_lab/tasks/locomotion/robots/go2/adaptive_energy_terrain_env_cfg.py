@@ -99,21 +99,24 @@ class AdaptiveEnergyTerrainEnvCfg(AdaptiveEnergyEnvCfg):
         # limits also halves their stage frontiers and neighborhood widths so
         # the number of neighboring bins activated by a success stays close
         # to the flat-task setting.
-        self.commands.base_velocity.limit_ranges.lin_vel_x = (-2.5, 2.5)
-        self.commands.base_velocity.limit_ranges.ang_vel_z = (-2.5, 2.5)
-        self.commands.base_velocity.linear_stage_threshold = 1.25
-        self.commands.base_velocity.angular_stage_threshold = 1.25
-        self.commands.base_velocity.local_range = (0.275, 0.10, 0.275)
-        self.commands.base_velocity.forward_error_abs = 0.15
-        # A zero-yaw command still leaves gait-induced yaw-rate oscillation
-        # around 0.2 rad/s, which alone consumed the flat-task angular floor
-        # and starved the all-axis within-tolerance fraction.
-        self.commands.base_velocity.angular_error_abs = 0.3
+        command = self.commands.base_velocity
+        # External curriculum commands (for example FloodFill) intentionally
+        # do not expose the staged RewardThreshold command fields.
+        if hasattr(command, "limit_ranges"):
+            command.limit_ranges.lin_vel_x = (-2.5, 2.5)
+            command.limit_ranges.ang_vel_z = (-2.5, 2.5)
+            command.linear_stage_threshold = 1.25
+            command.angular_stage_threshold = 1.25
+            command.local_range = (0.275, 0.10, 0.275)
+            command.forward_error_abs = 0.15
+            # A zero-yaw command still leaves gait-induced yaw-rate oscillation
+            # around 0.2 rad/s, which alone consumed the flat-task angular floor.
+            command.angular_error_abs = 0.3
 
-        # Command bins may expand once terrain training has left level 0, but
-        # only successes earned on the easier levels 0--3 count.
-        self.commands.base_velocity.terrain_gate_min_mean_level = 1.0
-        self.commands.base_velocity.curriculum_update_max_terrain_level = 3
+            # Command bins may expand once terrain training has left level 0,
+            # but only successes on easier levels 0--3 count.
+            command.terrain_gate_min_mean_level = 1.0
+            command.curriculum_update_max_terrain_level = 3
 
         if self.scene.terrain.terrain_generator is not None:
             self.scene.terrain.terrain_generator.curriculum = True

@@ -100,8 +100,11 @@ class RewardThresholdCurriculum:
         sampling_probabilities: tuple[float, float, float],
         frontier_bin_count: int,
         max_abs_vx: torch.Tensor | None = None,
+        min_vx: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mix curriculum sources while respecting per-environment speed limits."""
+        if min_vx is not None and min_vx < self.limits[0, 0].item():
+            raise ValueError("Minimum forward speed cannot be below the command-grid limit.")
         probabilities = torch.tensor(sampling_probabilities, device=self.device, dtype=torch.float)
         if torch.any(probabilities < 0.0) or not torch.isclose(
             probabilities.sum(), torch.tensor(1.0, device=self.device), atol=1.0e-6
@@ -136,11 +139,15 @@ class RewardThresholdCurriculum:
                         torch.isclose(max_abs_vx[sample_indices], speed_limit)
                     ]
                     candidate_mask = source_mask & (self.grid[:, 0].abs() <= speed_limit + 1.0e-6)
+                if min_vx is not None:
+                    candidate_mask = candidate_mask & (self.grid[:, 0] >= min_vx - 1.0e-6)
                 candidates = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
                 if candidates.numel() == 0:
                     fallback = active
                     if speed_limit is not None:
                         fallback = fallback & (self.grid[:, 0].abs() <= speed_limit + 1.0e-6)
+                    if min_vx is not None:
+                        fallback = fallback & (self.grid[:, 0] >= min_vx - 1.0e-6)
                     candidates = torch.nonzero(fallback, as_tuple=False).squeeze(-1)
                 if candidates.numel() == 0:
                     raise RuntimeError("No active velocity cell satisfies the terrain speed limit.")
@@ -162,6 +169,8 @@ class RewardThresholdCurriculum:
         commands = torch.maximum(torch.minimum(commands, self.limits[:, 1]), self.limits[:, 0])
         if max_abs_vx is not None:
             commands[:, 0] = torch.clamp(commands[:, 0], min=-max_abs_vx, max=max_abs_vx)
+        if min_vx is not None:
+            commands[:, 0].clamp_(min=min_vx)
         return commands, bin_ids, source_ids
 
     def update(
@@ -593,6 +602,22 @@ class MultiTerrainRewardThresholdVelocityCommand(RewardThresholdVelocityCommand)
             raise ValueError("Every terrain family needs one forward-speed envelope.")
         if any(not envelope or any(value <= 0.0 for value in envelope) for envelope in cfg.terrain_family_max_abs_vx):
             raise ValueError("Every family speed envelope must contain positive values.")
+        if len(cfg.terrain_family_forward_only) != len(cfg.terrain_family_names):
+            raise ValueError("Every terrain family needs one forward-only flag.")
+        if cfg.terrain_family_allocation_weights:
+            if len(cfg.terrain_family_allocation_weights) != len(cfg.terrain_family_names):
+                raise ValueError("Every terrain family needs one allocation weight.")
+            if any(weight < 0.0 for weight in cfg.terrain_family_allocation_weights):
+                raise ValueError("Terrain family allocation weights must be non-negative.")
+            if sum(cfg.terrain_family_allocation_weights) <= 0.0:
+                raise ValueError("At least one terrain family allocation weight must be positive.")
+            self._active_family_indices = [
+                index
+                for index, weight in enumerate(cfg.terrain_family_allocation_weights)
+                if weight > 0.0
+            ]
+        else:
+            self._active_family_indices = list(range(len(cfg.terrain_family_names)))
 
         limits = (
             cfg.limit_ranges.lin_vel_x,
@@ -712,30 +737,42 @@ class MultiTerrainRewardThresholdVelocityCommand(RewardThresholdVelocityCommand)
         self.metrics[f"{name}/curriculum_eligible_max_level"][:] = (
             0.0 if eligible is None else float(eligible)
         )
-        family_count = len(self.cfg.terrain_family_names)
-        self.metrics["curriculum_stage"][:] = sum(self._family_stages) / family_count
+        active_indices = self._active_family_indices
+        family_count = len(active_indices)
+        self.metrics["curriculum_stage"][:] = (
+            sum(self._family_stages[index] for index in active_indices) / family_count
+        )
         self.metrics["curriculum_stage_progress"][:] = sum(
             (
                 self._family_stage_success_counts[index] / self.cfg.stage_transition_successes
                 if self._family_stages[index] < 2
                 else 1.0
             )
-            for index in range(family_count)
+            for index in active_indices
         ) / family_count
-        self.metrics["terrain_gate_open"][:] = sum(self._family_terrain_gate_open) / family_count
-        known_emas = [value for value in self._family_terrain_level_ema if value is not None]
+        self.metrics["terrain_gate_open"][:] = (
+            sum(self._family_terrain_gate_open[index] for index in active_indices) / family_count
+        )
+        known_emas = [
+            self._family_terrain_level_ema[index]
+            for index in active_indices
+            if self._family_terrain_level_ema[index] is not None
+        ]
         self.metrics["terrain_level_ema"][:] = (
             sum(known_emas) / len(known_emas) if known_emas else 0.0
         )
         known_eligible = [
-            value for value in self._family_eligible_max_level if value is not None
+            self._family_eligible_max_level[index]
+            for index in active_indices
+            if self._family_eligible_max_level[index] is not None
         ]
         self.metrics["curriculum_eligible_max_level"][:] = (
             sum(known_eligible) / len(known_eligible) if known_eligible else 0.0
         )
         active_fractions = []
         mean_weights = []
-        for index, family_curriculum in enumerate(self.curricula):
+        for index in active_indices:
+            family_curriculum = self.curricula[index]
             family_allowed = family_curriculum.allowed_mask(self._family_stages[index])
             active_fractions.append(
                 float((family_curriculum.weights[family_allowed] > 0.0).float().mean().item())
@@ -853,6 +890,7 @@ class MultiTerrainRewardThresholdVelocityCommand(RewardThresholdVelocityCommand)
                 ),
                 self.cfg.frontier_bin_count,
                 max_abs_vx=max_abs_vx,
+                min_vx=0.0 if self.cfg.terrain_family_forward_only[family_index] else None,
             )
             commands[local_indices] = family_commands
             bin_ids[local_indices] = family_bins
@@ -994,3 +1032,5 @@ class MultiTerrainRewardThresholdVelocityCommandCfg(RewardThresholdVelocityComma
     terrain_family_names: tuple[str, ...] = ()
     terrain_columns_per_family: int = 1
     terrain_family_max_abs_vx: tuple[tuple[float, ...], ...] = ()
+    terrain_family_forward_only: tuple[bool, ...] = ()
+    terrain_family_allocation_weights: tuple[float, ...] = ()

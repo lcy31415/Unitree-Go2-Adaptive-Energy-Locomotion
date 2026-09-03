@@ -53,14 +53,14 @@ def test_stair_geometry_is_directed_and_uniformly_partitioned():
     generator = cfg.scene.terrain.terrain_generator
 
     assert tuple(generator.sub_terrains) == PIE_STAIRS_TERRAIN_NAMES
-    assert generator.num_rows == 4
+    assert generator.num_rows == 10
     assert generator.num_cols == len(PIE_STAIRS_TERRAIN_NAMES) * PIE_STAIRS_COLUMNS_PER_TYPE
     assert generator.class_type.__name__ == "DiscreteLevelTerrainGenerator"
     assert isinstance(generator.sub_terrains["stairs_up"], terrain_gen.MeshInvertedPyramidStairsTerrainCfg)
     assert isinstance(generator.sub_terrains["stairs_down"], terrain_gen.MeshPyramidStairsTerrainCfg)
     assert generator.sub_terrains["stairs_up"].proportion == 0.5
     assert generator.sub_terrains["stairs_down"].proportion == 0.5
-    assert cfg.scene.terrain.max_init_terrain_level == 3
+    assert cfg.scene.terrain.max_init_terrain_level == 9
 
 
 def test_stair_reset_and_completion_contract():

@@ -174,3 +174,12 @@ class AdaptiveEnergyPIERunnerCfg(AdaptiveEnergyLPACRLPIERunnerCfg):
     max_iterations = 30_000
     save_interval = 200
     experiment_name = "unitree_go2_adaptive_energy_pie"
+
+
+@configclass
+class AdaptiveEnergyStairsPIEFloodFillRunnerCfg(AdaptiveEnergyPIERunnerCfg):
+    """PIE settings for the stairs + flat flood-fill curriculum."""
+
+    max_iterations = 30_000
+    save_interval = 200
+    experiment_name = "unitree_go2_adaptive_energy_stairs_pie_floodfill"

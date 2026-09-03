@@ -5,6 +5,11 @@ from __future__ import annotations
 import isaaclab.terrains as terrain_gen
 
 from .adaptive_energy_lpacrl_terrain_cfg import (
+    ADAPTIVE_ENERGY_OBSTACLE_HEIGHT_RANGE,
+    ADAPTIVE_ENERGY_ROUGHNESS_RANGE,
+    ADAPTIVE_ENERGY_SLOPE_RANGE,
+    ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE,
+    ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
     DiscreteLevelTerrainGenerator,
     LPACRLRandomRoughTerrainCfg,
 )
@@ -19,14 +24,25 @@ ADAPTIVE_ENERGY_PIE_TERRAIN_NAMES = (
     "random_rough",
     "obstacles",
 )
-ADAPTIVE_ENERGY_PIE_NUM_LEVELS = 10
+# Keep a substantial flat-ground anchor to prevent catastrophic forgetting of
+# the nominal gait while still assigning most environments to uneven terrain.
+ADAPTIVE_ENERGY_PIE_TERRAIN_FAMILY_WEIGHTS = (
+    0.20,  # flat
+    0.25,  # stairs_up
+    0.20,  # stairs_down
+    0.075,  # slope_up
+    0.075,  # slope_down
+    0.15,  # random_rough
+    0.05,  # obstacles
+)
+ADAPTIVE_ENERGY_PIE_NUM_LEVELS = ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS
 ADAPTIVE_ENERGY_PIE_COLUMNS_PER_FAMILY = 4
-ADAPTIVE_ENERGY_PIE_STEP_HEIGHT_RANGE = (0.03, 0.15)
+ADAPTIVE_ENERGY_PIE_STEP_HEIGHT_RANGE = ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE
 # MuJoCo/Isaac terrain slopes are rise/run values. 0.35 corresponds to
 # atan(0.35)=19.3 degrees, substantially steeper than the old 0.20 maximum.
-ADAPTIVE_ENERGY_PIE_SLOPE_RANGE = (0.05, 0.35)
-ADAPTIVE_ENERGY_PIE_ROUGHNESS_RANGE = (0.01, 0.10)
-ADAPTIVE_ENERGY_PIE_OBSTACLE_HEIGHT_RANGE = (0.03, 0.15)
+ADAPTIVE_ENERGY_PIE_SLOPE_RANGE = ADAPTIVE_ENERGY_SLOPE_RANGE
+ADAPTIVE_ENERGY_PIE_ROUGHNESS_RANGE = ADAPTIVE_ENERGY_ROUGHNESS_RANGE
+ADAPTIVE_ENERGY_PIE_OBSTACLE_HEIGHT_RANGE = ADAPTIVE_ENERGY_OBSTACLE_HEIGHT_RANGE
 
 
 ADAPTIVE_ENERGY_PIE_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(

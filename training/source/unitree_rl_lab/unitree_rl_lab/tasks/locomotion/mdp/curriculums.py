@@ -8,6 +8,73 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def allocate_terrain_families(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int] | None,
+    family_weights: tuple[float, ...],
+    columns_per_family: int,
+) -> None:
+    """Assign an exact, deterministic environment budget to terrain families.
+
+    The generated terrain grid keeps the same number of columns per family so
+    all existing family-index and checkpoint contracts remain valid.  This
+    startup event only changes which terrain column each parallel environment
+    uses.  Integer counts are computed with the largest-remainder method, so
+    requested proportions sum exactly to ``num_envs`` even for small runs.
+    """
+    if not family_weights:
+        raise ValueError("Terrain family allocation weights must not be empty.")
+    if columns_per_family < 1:
+        raise ValueError("Terrain columns_per_family must be positive.")
+    if any(weight < 0.0 for weight in family_weights):
+        raise ValueError("Terrain family allocation weights must be non-negative.")
+    total_weight = float(sum(family_weights))
+    if total_weight <= 0.0:
+        raise ValueError("At least one terrain family allocation weight must be positive.")
+
+    if env_ids is None:
+        selected_env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    elif isinstance(env_ids, slice):
+        selected_env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)[env_ids]
+    else:
+        selected_env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    num_selected = int(selected_env_ids.numel())
+    if num_selected == 0:
+        return
+
+    normalized = [weight / total_weight for weight in family_weights]
+    exact_counts = [num_selected * weight for weight in normalized]
+    counts = [int(value) for value in exact_counts]
+    remainder = num_selected - sum(counts)
+    remainder_order = sorted(
+        range(len(family_weights)),
+        key=lambda index: (-(exact_counts[index] - counts[index]), index),
+    )
+    for family_index in remainder_order[:remainder]:
+        counts[family_index] += 1
+
+    terrain = env.scene.terrain
+    expected_columns = len(family_weights) * columns_per_family
+    if terrain.terrain_origins.shape[1] < expected_columns:
+        raise ValueError(
+            f"Terrain grid has {terrain.terrain_origins.shape[1]} columns; "
+            f"family allocation requires at least {expected_columns}."
+        )
+
+    cursor = 0
+    for family_index, count in enumerate(counts):
+        if count == 0:
+            continue
+        family_env_ids = selected_env_ids[cursor : cursor + count]
+        local_columns = torch.arange(count, device=env.device) % columns_per_family
+        terrain.terrain_types[family_env_ids] = family_index * columns_per_family + local_columns
+        cursor += count
+
+    terrain.env_origins[selected_env_ids] = terrain.terrain_origins[
+        terrain.terrain_levels[selected_env_ids], terrain.terrain_types[selected_env_ids]
+    ]
+
+
 def _terrain_level_update(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -132,6 +199,7 @@ def adaptive_energy_multiterrain_levels(
     minimum_expected_progress: float = 1.0,
     minimum_tracking_fraction: float = 0.7,
     minimum_tracking_fraction_for_hold: float | None = 0.45,
+    minimum_tracking_fraction_by_family: dict[str, float] | None = None,
     move_up_distance_fraction: float = 0.4,
     move_down_expected_fraction: float = 0.5,
 ) -> dict[str, torch.Tensor | float]:
@@ -141,6 +209,10 @@ def adaptive_energy_multiterrain_levels(
         raise ValueError("terrain_family_names must not be empty.")
     if columns_per_family < 1:
         raise ValueError("columns_per_family must be positive.")
+    overrides = minimum_tracking_fraction_by_family or {}
+    unknown = sorted(set(overrides) - set(terrain_family_names))
+    if unknown:
+        raise ValueError(f"Tracking-fraction overrides reference unknown families: {unknown}.")
 
     env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
     terrain = env.scene.terrain
@@ -152,12 +224,13 @@ def adaptive_energy_multiterrain_levels(
 
     for family_index, family_name in enumerate(terrain_family_names):
         reset_ids = env_ids[family_ids[env_ids] == family_index]
+        family_minimum_tracking_fraction = overrides.get(family_name, minimum_tracking_fraction)
         metrics, _ = _terrain_level_update(
             env,
             reset_ids,
             command_name,
             minimum_expected_progress,
-            minimum_tracking_fraction,
+            family_minimum_tracking_fraction,
             minimum_tracking_fraction_for_hold,
             move_up_distance_fraction,
             move_down_expected_fraction,
@@ -172,6 +245,8 @@ def adaptive_energy_multiterrain_levels(
             )
         for key, value in metrics.items():
             result[f"{family_name}/{key}"] = value
+            if all_family_ids.numel() == 0:
+                continue
             value_tensor = (
                 value
                 if isinstance(value, torch.Tensor)

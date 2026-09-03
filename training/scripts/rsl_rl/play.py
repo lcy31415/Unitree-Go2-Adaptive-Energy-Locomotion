@@ -40,6 +40,33 @@ parser.add_argument("--command_vx", type=float, default=None, help="Fix the comm
 parser.add_argument("--command_vy", type=float, default=None, help="Fix the commanded lateral velocity in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fix the commanded yaw rate in rad/s.")
 parser.add_argument(
+    "--heading_target_deg",
+    type=float,
+    default=None,
+    help=(
+        "Enable closed-loop heading control toward this absolute world yaw in degrees. "
+        "Mutually exclusive with --command_yaw."
+    ),
+)
+parser.add_argument(
+    "--heading_kp",
+    type=float,
+    default=1.5,
+    help="Closed-loop heading proportional gain [(rad/s)/rad] (default: 1.5).",
+)
+parser.add_argument(
+    "--heading_max_yaw_rate",
+    type=float,
+    default=0.5,
+    help="Closed-loop heading-command magnitude limit [rad/s] (default: 0.5).",
+)
+parser.add_argument(
+    "--heading_deadband_deg",
+    type=float,
+    default=1.0,
+    help="Set yaw-rate command to zero inside this heading-error deadband [deg] (default: 1.0).",
+)
+parser.add_argument(
     "--terrain_type",
     type=str,
     default=None,
@@ -122,13 +149,25 @@ if args_cli.terrain_type is not None:
     if args_cli.command_vx is not None:
         if args_cli.command_vy is None:
             args_cli.command_vy = 0.0
-        if args_cli.command_yaw is None:
+        if args_cli.command_yaw is None and args_cli.heading_target_deg is None:
             args_cli.command_yaw = 0.0
     if args_cli.num_envs is None:
         args_cli.num_envs = 1
     elif args_cli.num_envs != 1:
         parser.error("A fixed terrain demonstration currently requires --num_envs 1.")
-fixed_command_args = (args_cli.command_vx, args_cli.command_vy, args_cli.command_yaw)
+if args_cli.heading_target_deg is not None:
+    if args_cli.command_yaw is not None:
+        parser.error("--heading_target_deg and --command_yaw are mutually exclusive.")
+    if args_cli.command_vx is None:
+        parser.error("--heading_target_deg requires --command_vx.")
+    if args_cli.command_vy is None:
+        args_cli.command_vy = 0.0
+    # The controller overwrites this zero placeholder before every policy
+    # inference step. It also gives reset-time command hooks a complete tuple.
+    effective_command_yaw = 0.0
+else:
+    effective_command_yaw = args_cli.command_yaw
+fixed_command_args = (args_cli.command_vx, args_cli.command_vy, effective_command_yaw)
 if any(value is not None for value in fixed_command_args) and not all(
     value is not None for value in fixed_command_args
 ):
@@ -140,6 +179,10 @@ if args_cli.course:
         parser.error("--course requires --command_vx.")
 if args_cli.duration_s < 0.0:
     parser.error("--duration_s must be non-negative.")
+if args_cli.heading_kp <= 0.0 or args_cli.heading_max_yaw_rate <= 0.0:
+    parser.error("--heading_kp and --heading_max_yaw_rate must be positive.")
+if not 0.0 <= args_cli.heading_deadband_deg < 180.0:
+    parser.error("--heading_deadband_deg must be in [0, 180).")
 if args_cli.max_lateral_deviation <= 0.0 or not 0.0 < args_cli.max_heading_error_deg <= 180.0:
     parser.error("Course deviation limits must be positive and heading error must not exceed 180 degrees.")
 if args_cli.task is None:
@@ -148,6 +191,8 @@ if args_cli.task is None:
     checkpoint_hint = str(Path(args_cli.checkpoint).expanduser()).lower()
     if "flat_lpacrl_pie" in checkpoint_hint:
         args_cli.task = "Unitree-Go2-Adaptive-Energy-Flat-LPACRL-PIE"
+    elif "stairs_pie_floodfill" in checkpoint_hint:
+        args_cli.task = "Unitree-Go2-Adaptive-Energy-stairs-PIE-FloodFill"
     elif "stairs_pie" in checkpoint_hint:
         args_cli.task = "Unitree-Go2-Adaptive-Energy-stairs-PIE"
     elif "adaptive_energy_pie" in checkpoint_hint:
@@ -260,6 +305,51 @@ def _install_fixed_velocity_command(env, command: tuple[float, float, float]) ->
     )
 
 
+class _ClosedLoopHeadingController:
+    """Update the commanded yaw rate from world-frame heading feedback."""
+
+    def __init__(
+        self,
+        env,
+        target_heading_deg: float,
+        kp: float,
+        max_yaw_rate: float,
+        deadband_deg: float,
+    ) -> None:
+        self.command_term = env.unwrapped.command_manager.get_term("base_velocity")
+        self.robot = env.unwrapped.scene["robot"]
+        self.target = torch.full(
+            (env.unwrapped.num_envs,),
+            math.radians(target_heading_deg),
+            dtype=torch.float,
+            device=self.command_term.device,
+        )
+        self.kp = float(kp)
+        self.max_yaw_rate = float(max_yaw_rate)
+        self.deadband = math.radians(deadband_deg)
+        print(
+            "[INFO] Closed-loop heading control: "
+            f"target={target_heading_deg:.2f} deg, Kp={self.kp:.3f}, "
+            f"max_yaw_rate={self.max_yaw_rate:.3f} rad/s, "
+            f"deadband={deadband_deg:.2f} deg."
+        )
+
+    def update(self) -> None:
+        """Apply a wrapped proportional heading command for every environment."""
+        quaternion = _as_torch(self.robot.data.root_quat_w)
+        qx, qy, qz, qw = quaternion.unbind(dim=-1)
+        heading = torch.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy.square() + qz.square()),
+        )
+        raw_error = self.target - heading
+        error = torch.atan2(torch.sin(raw_error), torch.cos(raw_error))
+        yaw_rate = torch.clamp(self.kp * error, -self.max_yaw_rate, self.max_yaw_rate)
+        if self.deadband > 0.0:
+            yaw_rate = torch.where(error.abs() <= self.deadband, torch.zeros_like(yaw_rate), yaw_rate)
+        self.command_term.vel_command_b[:, 2] = yaw_rate
+
+
 def _terrain_columns_by_name(terrain_generator_cfg) -> dict[str, list[int]]:
     """Reproduce TerrainGenerator's proportional terrain-family-to-column mapping."""
     sub_terrains = terrain_generator_cfg.sub_terrains
@@ -328,26 +418,19 @@ def _install_fixed_terrain(env, terrain_type: str, terrain_level: int | None, te
     )
 
 
-# The CLI name describes the direction being tested. Moving from the center
-# toward +x descends a positive pyramid and ascends an inverted pyramid.
-_DIRECTIONAL_TERRAIN_GEOMETRY = {
-    "stairs_up": "stairs_down",
-    "stairs_down": "stairs_up",
-    "slope_up": "slope_down",
-    "slope_down": "slope_up",
-}
-
-
 def _as_torch(value):
     return getattr(value, "torch", value)
 
 
 def _configure_deterministic_course(env_cfg, requested_terrain: str) -> None:
     """Zero the reset state and widen landings for one fixed +x course attempt."""
-    geometry_terrain = _DIRECTIONAL_TERRAIN_GEOMETRY.get(requested_terrain, requested_terrain)
     generator_cfg = env_cfg.scene.terrain.terrain_generator
-    if requested_terrain in _DIRECTIONAL_TERRAIN_GEOMETRY and generator_cfg is not None:
-        geometry_cfg = generator_cfg.sub_terrains[geometry_terrain]
+    directional_terrains = {"stairs_up", "stairs_down", "slope_up", "slope_down"}
+    if requested_terrain in directional_terrains and generator_cfg is not None:
+        # Every registered terrain task now uses semantic family keys: the
+        # requested family itself contains the geometry traversed in world
+        # +x.  Do not silently swap up/down keys here.
+        geometry_cfg = generator_cfg.sub_terrains[requested_terrain]
         # A full-width landing is required after the last step/slope. The
         # training slopes use a 0.25 m border, which is too short for Go2.
         geometry_cfg.border_width = max(float(geometry_cfg.border_width), 1.0)
@@ -388,7 +471,13 @@ def _heading_from_xyzw(quaternion) -> float:
     return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
 
-def _run_directional_course(env, policy, robot, course: dict[str, float]) -> None:
+def _run_directional_course(
+    env,
+    policy,
+    robot,
+    course: dict[str, float],
+    heading_controller: _ClosedLoopHeadingController | None = None,
+) -> None:
     """Run one course attempt and report obstacle-only world-frame speed."""
     observation = env.get_observations()
     observation = observation[0] if isinstance(observation, tuple) else observation
@@ -412,6 +501,8 @@ def _run_directional_course(env, policy, robot, course: dict[str, float]) -> Non
         while simulation_app.is_running() and (
             args_cli.duration_s <= 0.0 or steps * step_dt < args_cli.duration_s
         ):
+            if heading_controller is not None:
+                heading_controller.update()
             observation, _, dones, _ = env.step(policy(observation))
             steps += 1
             elapsed = steps * step_dt
@@ -517,6 +608,16 @@ def main():
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     if all(value is not None for value in fixed_command_args):
         _install_fixed_velocity_command(env, fixed_command_args)
+    heading_controller = None
+    if args_cli.heading_target_deg is not None:
+        heading_controller = _ClosedLoopHeadingController(
+            env,
+            target_heading_deg=args_cli.heading_target_deg,
+            kp=args_cli.heading_kp,
+            max_yaw_rate=args_cli.heading_max_yaw_rate,
+            deadband_deg=args_cli.heading_deadband_deg,
+        )
+        heading_controller.update()
     if args_cli.terrain_type is not None:
         _install_fixed_terrain(
             env,
@@ -609,10 +710,14 @@ def main():
             raise ValueError(f"Unknown terrain type {args_cli.terrain_type!r}. Available: {available}.")
         family_columns = columns[args_cli.terrain_type]
         column = family_columns[args_cli.terrain_variant % len(family_columns)]
-        geometry_terrain = _DIRECTIONAL_TERRAIN_GEOMETRY.get(args_cli.terrain_type, args_cli.terrain_type)
-        course = _make_course_limits(terrain, args_cli.terrain_level or 0, column, geometry_terrain)
+        course = _make_course_limits(
+            terrain,
+            args_cli.terrain_level or 0,
+            column,
+            args_cli.terrain_type,
+        )
         robot = unwrapped_env.scene["robot"]
-        _run_directional_course(env, policy, robot, course)
+        _run_directional_course(env, policy, robot, course, heading_controller)
         env.close()
         return
 
@@ -622,6 +727,8 @@ def main():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if heading_controller is not None:
+                heading_controller.update()
             # agent stepping
             actions = policy(obs)
             # env stepping

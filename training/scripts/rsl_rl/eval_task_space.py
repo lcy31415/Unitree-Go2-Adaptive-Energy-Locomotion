@@ -1,4 +1,4 @@
-"""Evaluate the 600-task terrain LP-ACRL space with EPTE-SP metrics."""
+"""Evaluate the ten-level terrain LP-ACRL space with EPTE-SP metrics."""
 
 from __future__ import annotations
 
@@ -62,6 +62,7 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
 from unitree_rl_lab.tasks.locomotion.robots.go2.adaptive_energy_lpacrl_terrain_cfg import (
+    ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
     LPACRL_COLUMNS_PER_TYPE,
     LPACRL_TERRAIN_NAMES,
 )
@@ -70,7 +71,8 @@ from unitree_rl_lab.utils.parser_cfg import parse_env_cfg
 
 VX_EDGES = (0.0, 0.5, 1.0, 1.5, 2.0, 2.5)
 YAW_EDGES = (0.0, 0.5, 1.0, 1.5, 2.0, 2.5)
-NUM_LEVELS = 4
+NUM_LEVELS = ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS
+NUM_TASKS = (len(VX_EDGES) - 1) * (len(YAW_EDGES) - 1) * len(LPACRL_TERRAIN_NAMES) * NUM_LEVELS
 
 
 def _as_torch(value):
@@ -252,7 +254,7 @@ def _plot_results(summary: list[dict], output_dir: Path) -> None:
     axes[1][0].set_xlabel("terrain family")
     marginal(lambda row: row["terrain_level"], levels, axes[1][1], [f"L{level}" for level in levels])
     axes[1][1].set_xlabel("terrain geometry level")
-    figure.suptitle("Marginal success / survival across the 600-task space", fontsize=12)
+    figure.suptitle(f"Marginal success / survival across the {NUM_TASKS}-task space", fontsize=12)
     figure.savefig(output_dir / "lpacrl_task_space_marginals.png", dpi=180)
     plt.close(figure)
 

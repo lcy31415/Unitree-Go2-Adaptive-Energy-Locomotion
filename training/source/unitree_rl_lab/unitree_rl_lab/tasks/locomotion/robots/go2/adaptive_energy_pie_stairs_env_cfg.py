@@ -20,7 +20,11 @@ from .adaptive_energy_lpacrl_pie_env_cfg import (
     AdaptiveEnergyLPACRLPIEObservationsCfg,
     PIEActionsCfg,
 )
-from .adaptive_energy_lpacrl_terrain_cfg import DiscreteLevelTerrainGenerator
+from .adaptive_energy_lpacrl_terrain_cfg import (
+    ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE,
+    ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
+    DiscreteLevelTerrainGenerator,
+)
 from .adaptive_energy_terrain_env_cfg import AdaptiveEnergyTerrainSceneCfg
 from .pie_sensors_cfg import (
     PIE_FOOT_ORDER,
@@ -45,7 +49,7 @@ PIE_STAIRS_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     class_type=DiscreteLevelTerrainGenerator,
     size=(8.0, 8.0),
     border_width=20.0,
-    num_rows=4,
+    num_rows=ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
     num_cols=len(PIE_STAIRS_TERRAIN_NAMES) * PIE_STAIRS_COLUMNS_PER_TYPE,
     horizontal_scale=0.1,
     vertical_scale=0.005,
@@ -58,7 +62,7 @@ PIE_STAIRS_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     sub_terrains={
         "stairs_up": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=0.5,
-            step_height_range=(0.05, 0.15),
+            step_height_range=ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE,
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -66,7 +70,7 @@ PIE_STAIRS_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
         ),
         "stairs_down": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=0.5,
-            step_height_range=(0.05, 0.15),
+            step_height_range=ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE,
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -84,7 +88,10 @@ class AdaptiveEnergyPIEStairsSceneCfg(AdaptiveEnergyTerrainSceneCfg):
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=PIE_STAIRS_TERRAINS_CFG,
-        max_init_terrain_level=3,
+        # This focused task has no runtime terrain curriculum, so sample all
+        # ten unified levels from the beginning. Derived curriculum tasks
+        # override this to level zero and promote explicitly.
+        max_init_terrain_level=ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS - 1,
         use_terrain_origins=True,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(

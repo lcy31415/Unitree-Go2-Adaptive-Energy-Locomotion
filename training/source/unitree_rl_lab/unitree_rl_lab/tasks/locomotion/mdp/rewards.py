@@ -42,6 +42,52 @@ def _adaptive_reward_weights(
     return linear_weight, angular_weight, energy_weight
 
 
+def _terrain_conditioned_energy_weights(
+    env: ManagerBasedRLEnv,
+    linear_weight: torch.Tensor,
+    energy_weight: torch.Tensor,
+    terrain_columns_per_family: int = 1,
+    terrain_energy_scale_by_family_level: tuple[tuple[float, ...], ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce energy pressure on selected terrain levels without reducing reward mass.
+
+    Energy weight removed by the terrain scale is transferred to linear
+    tracking. This makes lifting a leg over a tall step preferable to saving
+    power by stalling, while preserving the original flat-ground objective.
+    """
+    if terrain_energy_scale_by_family_level is None:
+        return linear_weight, energy_weight
+    if terrain_columns_per_family < 1:
+        raise ValueError("terrain_columns_per_family must be positive.")
+
+    cache_key = (terrain_columns_per_family, terrain_energy_scale_by_family_level)
+    cache = getattr(env, "_adaptive_energy_scale_tables", None)
+    if cache is None:
+        cache = {}
+        setattr(env, "_adaptive_energy_scale_tables", cache)
+    scale_table = cache.get(cache_key)
+    if scale_table is None:
+        scale_table = torch.tensor(
+            terrain_energy_scale_by_family_level,
+            device=linear_weight.device,
+            dtype=linear_weight.dtype,
+        )
+        if scale_table.ndim != 2 or torch.any((scale_table < 0.0) | (scale_table > 1.0)):
+            raise ValueError("Terrain energy scales must form a rectangular table in [0, 1].")
+        cache[cache_key] = scale_table
+
+    terrain = env.scene.terrain
+    terrain_types = getattr(terrain.terrain_types, "torch", terrain.terrain_types).long()
+    terrain_levels = getattr(terrain.terrain_levels, "torch", terrain.terrain_levels).long()
+    family_ids = torch.div(
+        terrain_types, terrain_columns_per_family, rounding_mode="floor"
+    ).clamp(min=0, max=scale_table.shape[0] - 1)
+    terrain_levels = terrain_levels.clamp(min=0, max=scale_table.shape[1] - 1)
+    scale = scale_table[family_ids, terrain_levels]
+    released_energy_weight = energy_weight * (1.0 - scale)
+    return linear_weight + released_energy_weight, energy_weight * scale
+
+
 def energy(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize the energy used by the robot's joints."""
     asset: Articulation = env.scene[asset_cfg.name]
@@ -57,6 +103,8 @@ def adaptive_energy_tracking_lin_vel(
     tracking_sigma: float = 0.25,
     transition_speed: float = 1.7,
     energy_weight_decay: float = 0.3,
+    terrain_columns_per_family: int = 1,
+    terrain_energy_scale_by_family_level: tuple[tuple[float, ...], ...] | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Original dynamically weighted planar velocity-tracking reward.
@@ -68,7 +116,16 @@ def adaptive_energy_tracking_lin_vel(
     command = env.command_manager.get_command(command_name)
     squared_error = torch.square(asset.data.root_lin_vel_b[:, :2] - command[:, :2])
     raw_reward = torch.exp(-torch.sum(squared_error, dim=1) / tracking_sigma)
-    linear_weight, _, _ = _adaptive_reward_weights(command, transition_speed, energy_weight_decay)
+    linear_weight, _, energy_weight = _adaptive_reward_weights(
+        command, transition_speed, energy_weight_decay
+    )
+    linear_weight, _ = _terrain_conditioned_energy_weights(
+        env,
+        linear_weight,
+        energy_weight,
+        terrain_columns_per_family,
+        terrain_energy_scale_by_family_level,
+    )
     return linear_weight * raw_reward
 
 
@@ -130,6 +187,8 @@ def adaptive_energy_reward(
     energy_clip_rot: float = 0.2,
     transition_speed: float = 1.7,
     energy_weight_decay: float = 0.3,
+    terrain_columns_per_family: int = 1,
+    terrain_energy_scale_by_family_level: tuple[tuple[float, ...], ...] | None = None,
 ) -> torch.Tensor:
     """Dynamically weighted distance-averaged energy-efficiency reward."""
     robot: Articulation = env.scene[asset_cfg.name]
@@ -143,7 +202,16 @@ def adaptive_energy_reward(
     divider_lin = energy_sigma_lin * torch.clamp(torch.abs(base_lin_vel[:, 0]), min=energy_clip_lin)
     divider_ang = energy_sigma_ang * torch.clamp(torch.abs(base_ang_vel[:, 2]), min=energy_clip_rot)
     raw_reward = torch.exp(-power / (divider_lin + divider_ang))
-    _, _, energy_weight = _adaptive_reward_weights(command, transition_speed, energy_weight_decay)
+    linear_weight, _, energy_weight = _adaptive_reward_weights(
+        command, transition_speed, energy_weight_decay
+    )
+    _, energy_weight = _terrain_conditioned_energy_weights(
+        env,
+        linear_weight,
+        energy_weight,
+        terrain_columns_per_family,
+        terrain_energy_scale_by_family_level,
+    )
     return energy_weight * raw_reward
 
 
@@ -199,6 +267,8 @@ class adaptive_energy_reward_residual(ManagerTermBase):
         energy_clip_rot: float = 0.2,
         transition_speed: float = 1.7,
         energy_weight_decay: float = 0.3,
+        terrain_columns_per_family: int = 1,
+        terrain_energy_scale_by_family_level: tuple[tuple[float, ...], ...] | None = None,
         sigma_rew_neg: float = 0.02,
     ) -> torch.Tensor:
         robot: Articulation = env.scene[asset_cfg.name]
@@ -226,6 +296,13 @@ class adaptive_energy_reward_residual(ManagerTermBase):
 
         linear_weight, angular_weight, energy_weight = _adaptive_reward_weights(
             command, transition_speed, energy_weight_decay
+        )
+        linear_weight, energy_weight = _terrain_conditioned_energy_weights(
+            env,
+            linear_weight,
+            energy_weight,
+            terrain_columns_per_family,
+            terrain_energy_scale_by_family_level,
         )
 
         # Fixed auxiliary penalties from AdaptiveGo1Config.

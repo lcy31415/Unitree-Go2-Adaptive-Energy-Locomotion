@@ -16,6 +16,10 @@ from .adaptive_energy_lpacrl_pie_env_cfg import (
     AdaptiveEnergyLPACRLPIEObservationsCfg,
     PIEActionsCfg,
 )
+from .adaptive_energy_lpacrl_terrain_cfg import (
+    ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE,
+    ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS,
+)
 from .adaptive_energy_env_cfg import AdaptiveEnergyRewardsCfg
 from .adaptive_energy_pie_stairs_env_cfg import AdaptiveEnergyPIEStairsSceneCfg
 from .adaptive_energy_terrain_env_cfg import AdaptiveEnergyTerrainEnvCfg
@@ -23,8 +27,8 @@ from .pie_sensors_cfg import PIE_FOOT_SENSOR_NAMES, make_pie_base_clearance_scan
 from .velocity_env_cfg import TerminationsCfg
 
 
-STAIRS_PIE_NUM_LEVELS = 10
-STAIRS_PIE_STEP_HEIGHT_RANGE = (0.03, 0.15)
+STAIRS_PIE_NUM_LEVELS = ADAPTIVE_ENERGY_TERRAIN_NUM_LEVELS
+STAIRS_PIE_STEP_HEIGHT_RANGE = ADAPTIVE_ENERGY_STEP_HEIGHT_RANGE
 STAIRS_PIE_VELOCITY_GATE_MIN_MEAN_LEVEL = 2
 STAIRS_PIE_VELOCITY_GATE_CLOSE_MEAN_LEVEL = 1.5
 STAIRS_PIE_VELOCITY_UPDATE_LEVEL_MARGIN = 2
@@ -40,10 +44,9 @@ class AdaptiveEnergyStairsPIESceneCfg(AdaptiveEnergyPIEStairsSceneCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Lower the entry difficulty to 3 cm and resolve the 3--15 cm range
-        # into ten deterministic rows: 3.00, 4.33, ..., 15.00 cm. Configclass
-        # gives this scene its own generator copy, so the focused four-level
-        # ``Unitree-Go2-PIE-Stairs`` task remains unchanged at 5--15 cm.
+        # Resolve the shared 3--15 cm contract into ten deterministic rows:
+        # 3.00, 4.33, ..., 15.00 cm. Configclass gives this scene its own
+        # generator copy, while the constants keep every task synchronized.
         if self.terrain.terrain_generator is not None:
             self.terrain.terrain_generator.num_rows = STAIRS_PIE_NUM_LEVELS
             for terrain in self.terrain.terrain_generator.sub_terrains.values():

@@ -261,6 +261,38 @@ class _AdaptiveEnergyRewardLoggingWrapper(gym.Wrapper):
         "Episode_Reward/Renergy",
         "Episode_Reward/adaptive_energy_residual",
     )
+    # Keep the flood-grid terminal/TensorBoard view compact.  The complete
+    # per-cell state remains available in checkpoints and curriculum CSV
+    # snapshots; this allow-list only controls the scalar log presentation.
+    _FLOOD_GRID_GLOBAL_LOGS = {
+        "Curriculum/flood_grid/active",
+        "Curriculum/flood_grid/mastered",
+        "Curriculum/flood_grid/coverage",
+        "Curriculum/flood_grid/activation_events",
+        "Curriculum/flood_grid/mastery_events",
+        "Curriculum/flood_grid/forget_events",
+    }
+    _FLOOD_GRID_FAMILY_LOG_SUFFIXES = {
+        "active",
+        "mastered",
+        "coverage",
+        "mean_succ_ema",
+    }
+
+    @classmethod
+    def _is_concise_flood_grid_log(cls, key: str) -> bool:
+        if key in cls._FLOOD_GRID_GLOBAL_LOGS:
+            return True
+        prefix = "Curriculum/flood_grid/"
+        if not key.startswith(prefix):
+            return False
+        relative = key[len(prefix) :]
+        parts = relative.split("/")
+        return (
+            len(parts) == 2
+            and parts[0] in {"flat", "stairs_up", "stairs_down"}
+            and parts[1] in cls._FLOOD_GRID_FAMILY_LOG_SUFFIXES
+        )
 
     def __init__(self, env, concise_lpacrl: bool = False):
         super().__init__(env)
@@ -293,6 +325,7 @@ class _AdaptiveEnergyRewardLoggingWrapper(gym.Wrapper):
                 "Metrics/base_velocity/curriculum_eligible_max_level",
             }
             keep.update(key for key in log if key.startswith("Curriculum/lp_acrl/"))
+            keep.update(key for key in log if self._is_concise_flood_grid_log(key))
             terrain_metrics = {
                 "Curriculum/terrain_levels/mean_level",
                 "Curriculum/terrain_levels/move_up_fraction",
@@ -307,26 +340,36 @@ class _AdaptiveEnergyRewardLoggingWrapper(gym.Wrapper):
 
 
 def _get_lp_acrl_term(env):
-    """Return the stateful LP curriculum term, or None for all existing tasks."""
+    """Return the stateful curriculum term (LP-ACRL or flood grid), or None."""
     manager = getattr(env.unwrapped, "curriculum_manager", None)
-    if manager is None or "lp_acrl" not in manager.active_terms:
+    if manager is None:
         return None
-    index = manager.active_terms.index("lp_acrl")
-    term = manager._term_cfgs[index].func
-    return term if hasattr(term, "state_dict") and hasattr(term, "load_state_dict") else None
+    for term_name in ("lp_acrl", "flood_grid"):
+        if term_name not in manager.active_terms:
+            continue
+        index = manager.active_terms.index(term_name)
+        term = manager._term_cfgs[index].func
+        if hasattr(term, "state_dict") and hasattr(term, "load_state_dict"):
+            return term
+    return None
 
 
 def _attach_lp_acrl_checkpoint_state(runner, curriculum_term) -> None:
-    """Embed curriculum state in every normal RSL-RL checkpoint."""
+    """Embed a manager-owned curriculum state in every RSL-RL checkpoint."""
     original_save = runner.save
+    checkpoint_name = getattr(curriculum_term, "checkpoint_name", "lp_acrl")
+    state_key = f"{checkpoint_name}_state"
 
     def save_with_curriculum(_runner, path: str, infos: dict | None = None):
         merged_infos = dict(infos or {})
         curriculum_state = curriculum_term.state_dict()
-        merged_infos["lp_acrl_state"] = curriculum_state
+        merged_infos[state_key] = curriculum_state
         result = original_save(path, merged_infos)
         iteration = pathlib.Path(path).stem.removeprefix("model_")
-        torch.save(curriculum_state, pathlib.Path(path).parent / f"lp_acrl_state_{iteration}.pt")
+        torch.save(
+            curriculum_state,
+            pathlib.Path(path).parent / f"{checkpoint_name}_state_{iteration}.pt",
+        )
         snapshot_dir = pathlib.Path(path).parent / "curriculum"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot_path = snapshot_dir / f"{pathlib.Path(path).stem}.csv"
@@ -522,10 +565,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     if lp_acrl_term is not None:
         _attach_lp_acrl_checkpoint_state(runner, lp_acrl_term)
-        print(
-            f"[INFO] LP-ACRL: {lp_acrl_term.num_tasks} tasks, "
-            f"{lp_acrl_term.episodes_per_stage} completed episodes/stage, checkpoint state enabled."
-        )
+        curriculum_name = getattr(lp_acrl_term, "checkpoint_name", "lp_acrl")
+        if curriculum_name == "flood_grid":
+            grid_cells = sum(grid.num_cells for grid in lp_acrl_term.grids.values())
+            print(
+                f"[INFO] Flood grid: {len(lp_acrl_term.grids)} families, "
+                f"{grid_cells} cells, checkpoint state enabled."
+            )
+        else:
+            print(
+                f"[INFO] LP-ACRL: {lp_acrl_term.num_tasks} tasks, "
+                f"{lp_acrl_term.episodes_per_stage} completed episodes/stage, checkpoint state enabled."
+            )
     if command_curriculum_term is not None:
         _attach_command_curriculum_checkpoint_state(runner, command_curriculum_term)
         family_count = len(command_curriculum_term.cfg.terrain_family_names)
@@ -541,21 +592,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # load previously trained model
         checkpoint_infos = runner.load(resume_path)
         if lp_acrl_term is not None:
+            curriculum_name = getattr(lp_acrl_term, "checkpoint_name", "lp_acrl")
+            state_key = f"{curriculum_name}_state"
             curriculum_state = None
             if args_cli.curriculum_checkpoint is not None:
                 curriculum_path = os.path.abspath(os.path.expanduser(args_cli.curriculum_checkpoint))
                 if not os.path.isfile(curriculum_path):
-                    raise FileNotFoundError(f"LP-ACRL curriculum checkpoint does not exist: {curriculum_path}")
+                    raise FileNotFoundError(f"Curriculum checkpoint does not exist: {curriculum_path}")
                 curriculum_state = torch.load(curriculum_path, weights_only=False, map_location="cpu")
-                print(f"[INFO] Loading standalone LP-ACRL state from: {curriculum_path}")
+                print(f"[INFO] Loading standalone {curriculum_name} state from: {curriculum_path}")
             elif isinstance(checkpoint_infos, dict):
-                curriculum_state = checkpoint_infos.get("lp_acrl_state")
+                curriculum_state = checkpoint_infos.get(state_key)
             if curriculum_state is not None:
                 lp_acrl_term.load_state_dict(curriculum_state)
                 lp_acrl_term.resample_current_episodes()
-                print(f"[INFO] Restored LP-ACRL state at stage {lp_acrl_term.stage}.")
+                if curriculum_name == "flood_grid":
+                    env.unwrapped.reset()
+                    print("[INFO] Restored flood-grid state and resampled all current episodes.")
+                else:
+                    print(f"[INFO] Restored LP-ACRL state at stage {lp_acrl_term.stage}.")
             else:
-                print("[WARNING] Checkpoint has no LP-ACRL state; curriculum restarts uniformly.")
+                print(
+                    f"[WARNING] Checkpoint has no {state_key}; "
+                    f"the {curriculum_name} curriculum starts from its initial state."
+                )
         if command_curriculum_term is not None:
             command_state = None
             if args_cli.curriculum_checkpoint is not None:
